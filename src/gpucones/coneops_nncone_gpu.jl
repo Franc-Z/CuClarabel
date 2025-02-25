@@ -1,403 +1,323 @@
-# ## ------------------------------------
-# # Nonnegative Cone
-# # -------------------------------------
+#include <vector>
+#include <cmath>
+#include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/fill.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/for_each.h>
+#include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/inner_product.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/transform_scan.h>
+#include <thrust/sequence.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
 
-# degree(K::NonnegativeCone{T}) where {T} = K.dim
-# numel(K::NonnegativeCone{T}) where {T} = K.dim
+template <typename T>
+__global__ void _kernel_step_length_nonnegative(
+    T* dz,
+    T* ds,
+    T* z,
+    T* s,
+    T* α,
+    int len_rng,
+    T αmax
+) {
+    int i = (blockIdx.x - 1) * blockDim.x + threadIdx.x;
 
-# function rectify_equilibration!(
-#     K::NonnegativeCone{T},
-#     δ::AbstractVector{T},
-#     e::AbstractVector{T}
-# ) where{T}
+    if (i <= len_rng) {
+        T αz = dz[i] < 0 ? (min(αmax, -z[i] / dz[i])) : αmax;
+        T αs = ds[i] < 0 ? (min(αmax, -s[i] / ds[i])) : αmax;
+        α[i] = min(αz, αs);
+    }
+}
 
-#     #allow elementwise equilibration scaling
-#     δ .= one(T)
-#     return false
-# end
+template <typename T>
+T step_length_nonnegative(
+    thrust::device_vector<T>& dz,
+    thrust::device_vector<T>& ds,
+    thrust::device_vector<T>& z,
+    thrust::device_vector<T>& s,
+    thrust::device_vector<T>& α,
+    T αmax,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq
+) {
+    for (int i : idx_inq) {
+        int len_nn = rng_cones[i + 1] - rng_cones[i];
+        int rng_cone_i = rng_cones[i];
+        T* dzi = thrust::raw_pointer_cast(dz.data()) + rng_cone_i;
+        T* dsi = thrust::raw_pointer_cast(ds.data()) + rng_cone_i;
+        T* zi = thrust::raw_pointer_cast(z.data()) + rng_cone_i;
+        T* si = thrust::raw_pointer_cast(s.data()) + rng_cone_i;
+        T* αi = thrust::raw_pointer_cast(α.data()) + rng_cone_i;
 
-@inline function margins_nonnegative(
-    z::AbstractVector{T},
-    α::AbstractVector{T},
-    rng_cones::AbstractVector,
-    idx_inq::Vector{Cint},
-    αmin::T
-) where{T}
-    margin = zero(T)
-    
-    CUDA.@allowscalar @inbounds for i in idx_inq
-        rng_cone_i = rng_cones[i]
-        @views zi = z[rng_cone_i]
-        αmin = min(αmin,minimum(zi))
-        @views αi = α[rng_cone_i]
-        @. αi = max(zi,zero(T))
-        CUDA.synchronize()
-        margin += sum(αi)
-    end
+        int threads = std::min(len_nn, 1024);
+        int blocks = (len_nn + threads - 1) / threads;
 
-    return (αmin, margin)
-end
+        _kernel_step_length_nonnegative<<<blocks, threads>>>(
+            dzi,
+            dsi,
+            zi,
+            si,
+            αi,
+            len_nn,
+            αmax
+        );
+        cudaDeviceSynchronize();
 
-# place vector into nn cone
-@inline function scaled_unit_shift_nonnegative!(
-    z::AbstractVector{T},
-    rng_cones::AbstractVector,
-    idx_inq::Vector{Cint},
-    α::T
-) where{T}
+        αmax = thrust::reduce(α.begin() + rng_cone_i, α.begin() + rng_cone_i + len_nn, αmax, thrust::minimum<T>());
+    }
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            rng_cone_i = rng_cones[i]
-            @views @. z[rng_cone_i] += α 
-        end
-    end
-    CUDA.synchronize()
-end
+    return αmax;
+}
 
-# unit initialization for asymmetric solves
-@inline function unit_initialization_nonnegative!(
-   z::AbstractVector{T},
-   s::AbstractVector{T},
-   rng_cones::AbstractVector,
-   idx_inq::Vector{Cint}
-) where{T}
+template <typename T>
+__global__ void _kernel_compute_barrier_nonnegative(
+    T* barrier,
+    T* z,
+    T* s,
+    T* dz,
+    T* ds,
+    T α,
+    int len_nn
+) {
+    int i = (blockIdx.x - 1) * blockDim.x + threadIdx.x;
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            rng_cone_i = rng_cones[i]
-            @views @. z[rng_cone_i] = one(T)
-            @views @. s[rng_cone_i] = one(T)
-        end
-    end
-    CUDA.synchronize()
-end
+    if (i <= len_nn) {
+        barrier[i] = -log((s[i] + α * ds[i]) * (z[i] + α * dz[i]));
+    }
+}
 
-#configure cone internals to provide W = I scaling
-@inline function set_identity_scaling_nonnegative!(
-    w::AbstractVector{T},
-    rng_cones::AbstractVector,
-    idx_inq::Vector{Cint}
-) where {T}
+template <typename T>
+T compute_barrier_nonnegative(
+    thrust::device_vector<T>& work,
+    thrust::device_vector<T>& z,
+    thrust::device_vector<T>& s,
+    thrust::device_vector<T>& dz,
+    thrust::device_vector<T>& ds,
+    T α,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq
+) {
+    T barrier = 0;
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views @. w[rng_cones[i]] = one(T)
-        end
-    end
-    CUDA.synchronize()
-end
+    for (int i : idx_inq) {
+        int len_nn = rng_cones[i + 1] - rng_cones[i];
+        int rng_cone_i = rng_cones[i];
+        T* worki = thrust::raw_pointer_cast(work.data()) + rng_cone_i;
+        T* zi = thrust::raw_pointer_cast(z.data()) + rng_cone_i;
+        T* si = thrust::raw_pointer_cast(s.data()) + rng_cone_i;
+        T* dzi = thrust::raw_pointer_cast(dz.data()) + rng_cone_i;
+        T* dsi = thrust::raw_pointer_cast(ds.data()) + rng_cone_i;
 
-@inline function update_scaling_nonnegative!(
-    s::AbstractVector{T},
-    z::AbstractVector{T},
-    w::AbstractVector{T},
-    λ::AbstractVector{T},
-    rng_cones::AbstractVector,
-    idx_inq::Vector{Cint}    
-) where {T}
+        int threads = std::min(len_nn, 1024);
+        int blocks = (len_nn + threads - 1) / threads;
 
-    CUDA.@allowscalar for i in idx_inq
-        rng_cone_i = rng_cones[i]
-        @views  si = s[rng_cone_i]
-        @views  zi = z[rng_cone_i]
-        @views  @. λ[rng_cone_i] = sqrt(si*zi)
-        @views  @. w[rng_cone_i] = sqrt(si/zi)
-    end
-    CUDA.synchronize()
-end
+        _kernel_compute_barrier_nonnegative<<<blocks, threads>>>(
+            worki,
+            zi,
+            si,
+            dzi,
+            dsi,
+            α,
+            len_nn
+        );
+        cudaDeviceSynchronize();
 
-@inline function get_Hs_nonnegative!(
-    Hsblocks::AbstractVector{T},
-    w::AbstractVector{T},
-    rng_cones::AbstractVector,
-    rng_blocks::AbstractVector,
-    idx_inq::Vector{Cint}  
-) where {T}
+        barrier += thrust::reduce(work.begin() + rng_cone_i, work.begin() + rng_cone_i + len_nn, static_cast<T>(0), thrust::plus<T>());
+    }
 
-    #this block is diagonal, and we expect here
-    #to receive only the diagonal elements to fill
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views wi = w[rng_cones[i]]
-            @views @. Hsblocks[rng_blocks[i]] = wi^2
-        end
-    end
-    CUDA.synchronize()
-end
+    return barrier;
+}
 
-# compute the product y = WᵀWx
-@inline function mul_Hs_nonnegative!(
-    y::AbstractVector{T},
-    x::AbstractVector{T},
-    w::AbstractVector{T},
-    rng_cones::AbstractVector,
-    idx_inq::Vector{Cint} 
-) where {T}
+template <typename T>
+void margins_nonnegative(
+    thrust::device_vector<T>& z,
+    thrust::device_vector<T>& α,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq,
+    T& αmin,
+    T& margin
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        T* zi = thrust::raw_pointer_cast(z.data()) + rng_cone_i;
+        T* αi = thrust::raw_pointer_cast(α.data()) + rng_cone_i;
 
-    #NB : seemingly sensitive to order of multiplication
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views wi = w[rng_cones[i]]
-            @views xi = x[rng_cones[i]]
-            @views yi = y[rng_cones[i]]
-            @. yi = (wi * (wi * xi))
-        end
-    end
-    CUDA.synchronize()
-end
+        αmin = std::min(αmin, thrust::reduce(zi, zi + (rng_cones[i + 1] - rng_cones[i]), αmin, thrust::minimum<T>()));
+        thrust::transform(zi, zi + (rng_cones[i + 1] - rng_cones[i]), αi, thrust::placeholders::_1 = thrust::maximum(thrust::placeholders::_1, static_cast<T>(0)));
+        margin += thrust::reduce(αi, αi + (rng_cones[i + 1] - rng_cones[i]), static_cast<T>(0), thrust::plus<T>());
+    }
+}
 
-# returns ds = λ∘λ for the nn cone
-@inline function affine_ds_nonnegative!(
-    ds::AbstractVector{T},
-    λ::AbstractVector{T},
-    rng_cones::AbstractVector,
-    idx_inq::Vector{Cint} 
-) where {T}
+template <typename T>
+void scaled_unit_shift_nonnegative(
+    thrust::device_vector<T>& z,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq,
+    T α
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        T* zi = thrust::raw_pointer_cast(z.data()) + rng_cone_i;
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views @. ds[rng_cones[i]] = λ[rng_cones[i]]^2
-        end
-    end
-    CUDA.synchronize()
-end
+        thrust::transform(zi, zi + (rng_cones[i + 1] - rng_cones[i]), zi, thrust::placeholders::_1 + α);
+    }
+}
 
-@inline function combined_ds_shift_nonnegative!(
-    shift::AbstractVector{T},
-    step_z::AbstractVector{T},
-    step_s::AbstractVector{T},
-    w::AbstractVector{T},
-    σμ::T,
-    rng_cones::AbstractVector,
-    idx_inq::Vector{Cint} 
-) where {T}
+template <typename T>
+void unit_initialization_nonnegative(
+    thrust::device_vector<T>& z,
+    thrust::device_vector<T>& s,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        T* zi = thrust::raw_pointer_cast(z.data()) + rng_cone_i;
+        T* si = thrust::raw_pointer_cast(s.data()) + rng_cone_i;
 
-    # The shift must be assembled carefully if we want to be economical with
-    # allocated memory.  Will modify the step.z and step.s in place since
-    # they are from the affine step and not needed anymore.
-    #
-    # We can't have aliasing vector arguments to gemv_W or gemv_Winv, so 
-    # we need a temporary variable to assign #Δz <= WΔz and Δs <= W⁻¹Δs
+        thrust::fill(zi, zi + (rng_cones[i + 1] - rng_cones[i]), static_cast<T>(1));
+        thrust::fill(si, si + (rng_cones[i + 1] - rng_cones[i]), static_cast<T>(1));
+    }
+}
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views shift_i = shift[rng_cones[i]]
-            step_zi = step_z[rng_cones[i]]
-            step_si = step_s[rng_cones[i]]
-            wi = w[rng_cones[i]]
+template <typename T>
+void set_identity_scaling_nonnegative(
+    thrust::device_vector<T>& w,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        T* wi = thrust::raw_pointer_cast(w.data()) + rng_cone_i;
 
-            #shift vector used as workspace for a few steps 
-            tmp = shift_i              
+        thrust::fill(wi, wi + (rng_cones[i + 1] - rng_cones[i]), static_cast<T>(1));
+    }
+}
 
-                #Δz <- WΔz
-            @. tmp = step_zi           
-            @. step_zi = tmp*wi
+template <typename T>
+void update_scaling_nonnegative(
+    thrust::device_vector<T>& s,
+    thrust::device_vector<T>& z,
+    thrust::device_vector<T>& w,
+    thrust::device_vector<T>& λ,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        T* si = thrust::raw_pointer_cast(s.data()) + rng_cone_i;
+        T* zi = thrust::raw_pointer_cast(z.data()) + rng_cone_i;
+        T* λi = thrust::raw_pointer_cast(λ.data()) + rng_cone_i;
+        T* wi = thrust::raw_pointer_cast(w.data()) + rng_cone_i;
 
-            #Δs <- W⁻¹Δs
-            @. tmp = step_si           
-            @. step_si = tmp/wi
+        thrust::transform(si, si + (rng_cones[i + 1] - rng_cones[i]), zi, λi, thrust::placeholders::_1 = sqrt(thrust::placeholders::_1 * thrust::placeholders::_2));
+        thrust::transform(si, si + (rng_cones[i + 1] - rng_cones[i]), zi, wi, thrust::placeholders::_1 = sqrt(thrust::placeholders::_1 / thrust::placeholders::_2));
+    }
+}
 
-            #shift = W⁻¹Δs ∘ WΔz - σμe
-            @. shift_i = step_si*step_zi - σμ    
-        end
-    end    
-    CUDA.synchronize()               
-end
+template <typename T>
+void get_Hs_nonnegative(
+    thrust::device_vector<T>& Hsblocks,
+    thrust::device_vector<T>& w,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& rng_blocks,
+    thrust::device_vector<int>& idx_inq
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        int rng_block_i = rng_blocks[i];
+        T* wi = thrust::raw_pointer_cast(w.data()) + rng_cone_i;
+        T* Hsblocki = thrust::raw_pointer_cast(Hsblocks.data()) + rng_block_i;
 
-@inline function Δs_from_Δz_offset_nonnegative!(
-    out::AbstractVector{T},
-    ds::AbstractVector{T},
-    z::AbstractVector{T},
-    rng_cones::AbstractVector,
-    idx_inq::Vector{Cint} 
-) where {T}
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views @. out[rng_cones[i]] = ds[rng_cones[i]] / z[rng_cones[i]]
-        end
-    end
-    CUDA.synchronize()
-end
+        thrust::transform(wi, wi + (rng_cones[i + 1] - rng_cones[i]), Hsblocki, thrust::placeholders::_1 = thrust::placeholders::_1 * thrust::placeholders::_1);
+    }
+}
 
-#return maximum allowable step length while remaining in the nn cone
-function _kernel_step_length_nonnegative(
-    dz::AbstractVector{T},
-    ds::AbstractVector{T},
-     z::AbstractVector{T},
-     s::AbstractVector{T},
-     α::AbstractVector{T},
-     len_rng::Cint,
-     αmax::T
-) where {T}
+template <typename T>
+void mul_Hs_nonnegative(
+    thrust::device_vector<T>& y,
+    thrust::device_vector<T>& x,
+    thrust::device_vector<T>& w,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        T* wi = thrust::raw_pointer_cast(w.data()) + rng_cone_i;
+        T* xi = thrust::raw_pointer_cast(x.data()) + rng_cone_i;
+        T* yi = thrust::raw_pointer_cast(y.data()) + rng_cone_i;
 
+        thrust::transform(wi, wi + (rng_cones[i + 1] - rng_cones[i]), xi, yi, thrust::placeholders::_1 = thrust::placeholders::_1 * thrust::placeholders::_1 * thrust::placeholders::_2);
+    }
+}
 
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-    if i <= len_rng
-        αz = dz[i] < 0 ? (min(αmax,-z[i]/dz[i])) : αmax
-        αs = ds[i] < 0 ? (min(αmax,-s[i]/ds[i])) : αmax
-        α[i] = min(αz, αs)
-    end
+template <typename T>
+void affine_ds_nonnegative(
+    thrust::device_vector<T>& ds,
+    thrust::device_vector<T>& λ,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        T* dsi = thrust::raw_pointer_cast(ds.data()) + rng_cone_i;
+        T* λi = thrust::raw_pointer_cast(λ.data()) + rng_cone_i;
 
-    return nothing
-end
+        thrust::transform(λi, λi + (rng_cones[i + 1] - rng_cones[i]), dsi, thrust::placeholders::_1 = thrust::placeholders::_1 * thrust::placeholders::_1);
+    }
+}
 
-@inline function step_length_nonnegative(
-    dz::AbstractVector{T},
-    ds::AbstractVector{T},
-     z::AbstractVector{T},
-     s::AbstractVector{T},
-     α::AbstractVector{T},
-     αmax::T,
-     rng_cones::AbstractVector,
-     idx_inq::Vector{Cint} 
-) where {T}
+template <typename T>
+void combined_ds_shift_nonnegative(
+    thrust::device_vector<T>& shift,
+    thrust::device_vector<T>& step_z,
+    thrust::device_vector<T>& step_s,
+    thrust::device_vector<T>& w,
+    T σμ,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        T* shift_i = thrust::raw_pointer_cast(shift.data()) + rng_cone_i;
+        T* step_zi = thrust::raw_pointer_cast(step_z.data()) + rng_cone_i;
+        T* step_si = thrust::raw_pointer_cast(step_s.data()) + rng_cone_i;
+        T* wi = thrust::raw_pointer_cast(w.data()) + rng_cone_i;
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            len_nn = Cint(length(rng_cones[i]))
-            rng_cone_i = rng_cones[i]
-            @views dzi = dz[rng_cone_i]
-            @views dsi = ds[rng_cone_i]
-            @views zi = z[rng_cone_i]
-            @views si = s[rng_cone_i]
-            @views αi = α[rng_cone_i]
-            
-            kernel = @cuda launch=false _kernel_step_length_nonnegative(dzi, dsi, zi, si, αi, len_nn, αmax)
-            config = launch_configuration(kernel.fun)
-            threads = min(len_nn, config.threads)
-            blocks = cld(len_nn, threads)
-        
-            CUDA.@sync kernel(dzi, dsi, zi, si, αi, len_nn, αmax; threads, blocks)
-            αmax = min(αmax,minimum(αi))
-        end
-    end
+        thrust::device_vector<T> tmp(step_zi, step_zi + (rng_cones[i + 1] - rng_cones[i]));
 
-    return αmax
-end
+        thrust::transform(tmp.begin(), tmp.end(), wi, step_zi, thrust::placeholders::_1 = thrust::placeholders::_1 * thrust::placeholders::_2);
+        thrust::transform(tmp.begin(), tmp.end(), wi, step_si, thrust::placeholders::_1 = thrust::placeholders::_1 / thrust::placeholders::_2);
+        thrust::transform(step_si, step_si + (rng_cones[i + 1] - rng_cones[i]), step_zi, shift_i, thrust::placeholders::_1 = thrust::placeholders::_1 * thrust::placeholders::_2 - σμ);
+    }
+}
 
-function _kernel_compute_barrier_nonnegative(
-    barrier::AbstractVector{T},
-    z::AbstractVector{T},
-    s::AbstractVector{T},
-    dz::AbstractVector{T},
-    ds::AbstractVector{T},
-    α::T,
-    len_nn::Cint
-) where {T}
+template <typename T>
+void Δs_from_Δz_offset_nonnegative(
+    thrust::device_vector<T>& out,
+    thrust::device_vector<T>& ds,
+    thrust::device_vector<T>& z,
+    thrust::device_vector<int>& rng_cones,
+    thrust::device_vector<int>& idx_inq
+) {
+    for (int i : idx_inq) {
+        int rng_cone_i = rng_cones[i];
+        T* out_i = thrust::raw_pointer_cast(out.data()) + rng_cone_i;
+        T* dsi = thrust::raw_pointer_cast(ds.data()) + rng_cone_i;
+        T* zi = thrust::raw_pointer_cast(z.data()) + rng_cone_i;
 
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-    if i <= len_nn
-        barrier[i] = -logsafe((s[i] + α*ds[i])*(z[i] + α*dz[i]))
-    end
-
-    return nothing
-end
-
-@inline function compute_barrier_nonnegative(
-    work::AbstractVector{T},
-    z::AbstractVector{T},
-    s::AbstractVector{T},
-    dz::AbstractVector{T},
-    ds::AbstractVector{T},
-    α::T,
-    rng_cones::AbstractVector,
-    idx_inq::Vector{Cint},
-    len_nn::Cint
-) where {T}
-
-    barrier = zero(T)
-    CUDA.@allowscalar for i in idx_inq
-        rng_cone_i = rng_cones[i]
-        @views worki = work[rng_cone_i]
-        @views @. worki = -logsafe((s[rng_cone_i] + α*ds[rng_cone_i])*(z[rng_cone_i] + α*dz[rng_cone_i]))
-        CUDA.synchronize()
-        barrier += sum(worki)
-    end
-
-    return barrier
-end
-
-# # ---------------------------------------------
-# # operations supported by symmetric cones only 
-# # ---------------------------------------------
-
-# # implements y = αWx + βy for the nn cone
-# function mul_W!(
-#     K::NonnegativeCone{T},
-#     is_transpose::Symbol,
-#     y::AbstractVector{T},
-#     x::AbstractVector{T},
-#     α::T,
-#     β::T
-# ) where {T}
-
-#   #W is diagonal so ignore transposition
-#   #@. y = α*(x*K.w) + β*y
-#   @inbounds for i = eachindex(y)
-#       y[i] = α*(x[i]*K.w[i]) + β*y[i]
-#   end
-
-#   return nothing
-# end
-
-# # implements y = αW^{-1}x + βy for the nn cone
-# function mul_Winv!(
-#     K::NonnegativeCone{T},
-#     is_transpose::Symbol,
-#     y::AbstractVector{T},
-#     x::AbstractVector{T},
-#     α::T,
-#     β::T
-# ) where {T}
-
-#   #W is diagonal, so ignore transposition
-#   #@. y = α*(x/K.w) + β.*y
-#   @inbounds for i = eachindex(y)
-#       y[i] = α*(x[i]/K.w[i]) + β*y[i]
-#   end
-
-#   return nothing
-# end
-
-# # implements x = λ \ z for the nn cone, where λ
-# # is the internally maintained scaling variable.
-# function λ_inv_circ_op!(
-#     K::NonnegativeCone{T},
-#     x::AbstractVector{T},
-#     z::AbstractVector{T}
-# ) where {T}
-
-#     inv_circ_op!(K, x, K.λ, z)
-
-# end
-
-# # ---------------------------------------------
-# # Jordan algebra operations for symmetric cones 
-# # ---------------------------------------------
-
-# # implements x = y ∘ z for the nn cone
-# function circ_op!(
-#     K::NonnegativeCone{T},
-#     x::AbstractVector{T},
-#     y::AbstractVector{T},
-#     z::AbstractVector{T}
-# ) where {T}
-
-#     @. x = y*z
-
-#     return nothing
-# end
-
-# # implements x = y \ z for the nn cone
-# function inv_circ_op!(
-#     K::NonnegativeCone{T},
-#     x::AbstractVector{T},
-#     y::AbstractVector{T},
-#     z::AbstractVector{T}
-# ) where {T}
-
-#     @. x = z/y
-
-#     return nothing
-# end
+        thrust::transform(dsi, dsi + (rng_cones[i + 1] - rng_cones[i]), zi, out_i, thrust::placeholders::_1 = thrust::placeholders::_1 / thrust::placeholders::_2);
+    }
+}

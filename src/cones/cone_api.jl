@@ -23,7 +23,7 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/iterator/discard_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
-#include <thrust/iterator/zip_function.h>
+#include <thrust/iterator/zip_iterator.h>
 
 namespace Clarabel {
 
@@ -37,23 +37,28 @@ enum class SupportedCone {
     PSDTriangleConeT
 };
 
-struct ZeroConeT {
+class ZeroConeT {
+public:
     int dim;
 };
 
-struct NonnegativeConeT {
+class NonnegativeConeT {
+public:
     int dim;
 };
 
-struct SecondOrderConeT {
+class SecondOrderConeT {
+public:
     int dim;
 };
 
-struct PowerConeT {
+class PowerConeT {
+public:
     float alpha;
 };
 
-struct GenPowerConeT {
+class GenPowerConeT {
+public:
     std::vector<float> alpha;
     int dim2;
 
@@ -63,9 +68,10 @@ struct GenPowerConeT {
     }
 };
 
-struct ExponentialConeT {};
+class ExponentialConeT {};
 
-struct PSDTriangleConeT {
+class PSDTriangleConeT {
+public:
     int dim;
 };
 

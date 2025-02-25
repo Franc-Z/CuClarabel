@@ -1,10 +1,11 @@
+#include <cuda_runtime.h>
+#include <cusparse.h>
+#include <CUDSS/CudssSolver.h>
+#include <vector>
+#include <map>
 
-using CUDA, CUDA.CUSPARSE, CUDA.CUSOLVER
-using CUDSS
-
-include("./gpu_defaults.jl")
-include("./directldl_cudss.jl")
-include("./directldl_mixed_cudss.jl")
-include("directgpu_kkt_assembly.jl")
-include("directgpu_datamaps.jl")
-
+#include "gpu_defaults.hpp"
+#include "directldl_cudss.hpp"
+#include "directldl_mixed_cudss.hpp"
+#include "directgpu_kkt_assembly.hpp"
+#include "directgpu_datamaps.hpp"

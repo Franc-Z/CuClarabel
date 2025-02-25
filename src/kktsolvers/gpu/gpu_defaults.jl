@@ -1,6 +1,6 @@
 abstract type AbstractGPUSolver{T <: AbstractFloat} end
 
-const GPUSolversDict = Dict{Symbol, UnionAll}()
+const GPUSolversDict = Dict{Symbol, UnionAll>()
 
 # Any new indirect solver type should provide implementations of all
 # of the following and add itself to the IndirectSolversDict
