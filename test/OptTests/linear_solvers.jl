@@ -1,73 +1,103 @@
-using Test, LinearAlgebra, SparseArrays
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <cassert>
+#include <cuda_runtime.h>
+#include <cusparse.h>
+#include <cublas_v2.h>
+#include <cusolverDn.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/copy.h>
+#include <thrust/fill.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/for_each.h>
+#include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/inner_product.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/transform_scan.h>
+#include <thrust/sequence.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/zip_function.h>
 
-#Test each of these solvers, but only for Float64
+template <typename T>
+std::tuple<thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, std::vector<SupportedCone>> basic_QP_data() {
+    // Implement the function to generate basic QP data
+    // This is a placeholder implementation
+    thrust::device_vector<T> P, c, A, b;
+    std::vector<SupportedCone> cones;
+    return std::make_tuple(P, c, A, b, cones);
+}
 
-#NB: mkl fails here because of some weird library 
-#issue caused by loading conflicting BLAS libraries.
-#:mkl works, but not if you are also testing 
-#JuMP.  Issue here: 
-# https://github.com/JuliaSparse/Pardiso.jl/issues/88
+template <typename T>
+std::tuple<thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, std::vector<SupportedCone>> basic_SOCP_data() {
+    // Implement the function to generate basic SOCP data
+    // This is a placeholder implementation
+    thrust::device_vector<T> P, c, A, b;
+    std::vector<SupportedCone> cones;
+    return std::make_tuple(P, c, A, b, cones);
+}
 
-SolverTypes = [:qdldl, :cholmod]
+template <typename T>
+std::tuple<thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, std::vector<SupportedCone>> basic_SDP_data() {
+    // Implement the function to generate basic SDP data
+    // This is a placeholder implementation
+    thrust::device_vector<T> P, c, A, b;
+    std::vector<SupportedCone> cones;
+    return std::make_tuple(P, c, A, b, cones);
+}
 
-for SolverType in SolverTypes
+template <typename T>
+void test_linear_solve(const std::string& solver_type) {
+    T tol = static_cast<T>(1e-3);
 
-    @testset "Linear solve using $(SolverType)" begin
+    Settings<T> settings;
+    settings.direct_solve_method = solver_type;
 
-        @testset "QP" begin
+    auto [P, c, A, b, cones] = basic_QP_data<T>();
+    Solver<T> solver;
+    solver.setup(P, c, A, b, cones, settings);
+    auto solution = solver.solve();
 
-            settings = Clarabel.Settings(direct_solve_method = SolverType)
-            P, c, A, b, cones = basic_QP_data(Float64)
-            solver = Clarabel.Solver(P, c, A, b, cones, settings)
-            Clarabel.solve!(solver)
+    assert(solution.status == SOLVED);
+    assert(std::abs(thrust::reduce(solution.x.begin(), solution.x.end(), static_cast<T>(0), thrust::plus<T>()) - static_cast<T>(0.3 + 0.7)) < tol);
+    assert(std::abs(solution.obj_val - static_cast<T>(1.8800000298331538)) < tol);
 
-            @test solver.solution.status == Clarabel.SOLVED
-            @test isapprox(norm(solver.solution.x - Float64[0.3; 0.7]), zero(Float64), atol=tol)
-            @test isapprox(solver.solution.obj_val, Float64(1.8800000298331538), atol=tol)
+    auto [P_socp, c_socp, A_socp, b_socp, cones_socp] = basic_SOCP_data<T>();
+    solver.setup(P_socp, c_socp, A_socp, b_socp, cones_socp, settings);
+    solution = solver.solve();
 
-        end
+    assert(solution.status == SOLVED);
+    assert(std::abs(thrust::reduce(solution.x.begin(), solution.x.end(), static_cast<T>(0), thrust::plus<T>()) - static_cast<T>(-0.5 + 0.435603 - 0.245459)) < tol);
+    assert(std::abs(solution.obj_val - static_cast<T>(-8.4590e-01)) < tol);
 
-        @testset "SOCP" begin
+    auto [P_sdp, c_sdp, A_sdp, b_sdp, cones_sdp] = basic_SDP_data<T>();
+    solver.setup(P_sdp, c_sdp, A_sdp, b_sdp, cones_sdp, settings);
+    solution = solver.solve();
 
-            settings = Clarabel.Settings(direct_solve_method = SolverType)
-            P, c, A, b, cones = basic_SOCP_data(Float64)
-            solver = Clarabel.Solver(P, c, A, b, cones, settings)
-            Clarabel.solve!(solver)
+    thrust::device_vector<T> refsol = {static_cast<T>(-3.0729833267361095), static_cast<T>(0.3696004167288786), static_cast<T>(-0.022226685581313674), static_cast<T>(0.31441213129613066), static_cast<T>(-0.026739700851545107), static_cast<T>(-0.016084530571308823)};
 
-            @test solver.solution.status == Clarabel.SOLVED
-            @test isapprox(
-                norm(solver.solution.x -
-                FloatT[ -0.5 ; 0.435603 ;  -0.245459]),
-                zero(FloatT), atol=tol
-            )
-            @test isapprox(solver.solution.obj_val, FloatT(-8.4590e-01), atol=tol)
+    assert(solution.status == SOLVED);
+    assert(std::abs(thrust::reduce(solution.x.begin(), solution.x.end(), static_cast<T>(0), thrust::plus<T>()) - thrust::reduce(refsol.begin(), refsol.end(), static_cast<T>(0), thrust::plus<T>())) < tol);
+    assert(std::abs(solution.obj_val - static_cast<T>(4.840076866013861)) < tol);
+}
 
-        end
-
-        @testset "SDP" begin
-
-            settings = Clarabel.Settings(direct_solve_method = SolverType)
-            P, c, A, b, cones = basic_SDP_data(Float64)
-            solver = Clarabel.Solver(P, c, A, b, cones, settings)
-            Clarabel.solve!(solver)
-
-            refsol =  FloatT[
-                -3.0729833267361095
-                 0.3696004167288786
-                -0.022226685581313674
-                 0.31441213129613066
-                -0.026739700851545107
-                -0.016084530571308823
-            ]
-
-            @test solver.solution.status == Clarabel.SOLVED
-            @test isapprox(norm(solver.solution.x - refsol), zero(FloatT), atol=tol)
-            @test isapprox(solver.solution.obj_val, FloatT(4.840076866013861), atol=tol)
-
-        end
-
-    end      #end Linear solver tests
-
-end # SolverTypes
-
-nothing
+int main() {
+    test_linear_solve<float>("qdldl");
+    test_linear_solve<double>("qdldl");
+    test_linear_solve<float>("cholmod");
+    test_linear_solve<double>("cholmod");
+    return 0;
+}

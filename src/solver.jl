@@ -1,579 +1,365 @@
-# -------------------------------------
-# utility constructor that includes
-# both object creation and setup
-#--------------------------------------
-function Solver(
-    P::AbstractMatrix{T},
-    c::Vector{T},
-    A::AbstractMatrix{T},
-    b::Vector{T},
-    cones::Vector{<:SupportedCone},
-    kwargs...
-) where{T <: AbstractFloat}
-
-    s = Solver{T}()
-    setup!(s,P,c,A,b,cones,kwargs...)
-    return s
-end
-
-# -------------------------------------
-# setup!
-# -------------------------------------
-
-
-"""
-	setup!(solver, P, q, A, b, cones, [settings])
-
-Populates a [`Solver`](@ref) with a cost function defined by `P` and `q`, and one or more conic constraints defined by `A`, `b` and a description of a conic constraint composed of cones whose types and dimensions are specified by `cones.`
-
-The solver will be configured to solve the following optimization problem:
-
-```
-min   1/2 x'Px + q'x
-s.t.  Ax + s = b, s ∈ K
-```
-
-All data matrices must be sparse.   The matrix `P` is assumed to be symmetric and positive semidefinite, and only the upper triangular part is used.
-
-The cone `K` is a composite cone.   To define the cone the user should provide a vector of cone specifications along
-with the appropriate dimensional information.   For example, to generate a cone in the nonnegative orthant followed by
-a second order cone, use:
-
-```
-cones = [Clarabel.NonnegativeConeT(dim_1),
-         Clarabel.SecondOrderConeT(dim_2)]
-```
-
-If the argument 'cones' is constructed incrementally, the should should initialize it as an empty array of the supertype for all allowable cones, e.g.
-
-```
-cones = Clarabel.SupportedCone[]
-push!(cones,Clarabel.NonnegativeConeT(dim_1))
-...
-```
-
-The optional argument `settings` can be used to pass custom solver settings:
-```julia
-settings = Clarabel.Settings(verbose = true)
-setup!(model, P, q, A, b, cones, settings)
-```
-
-To solve the problem, you must make a subsequent call to [`solve!`](@ref)
-"""
-function setup!(s,P,c,A,b,cones,settings::Settings)
-    #this allows total override of settings during setup
-    s.settings = settings
-    setup!(s,P,c,A,b,cones)
-end
-
-function setup!(s,P,c,A,b,cones; kwargs...)
-    #this allows override of individual settings during setup
-    settings_populate!(s.settings, Dict(kwargs))
-    setup!(s,P,c,A,b,cones)
-end
-
-# main setup function
-function setup!(
-    s::Solver{T},
-    P::AbstractMatrix{T},
-    q::Vector{T},
-    A::AbstractMatrix{T},
-    b::Vector{T},
-    cones::Vector{<:SupportedCone},
-) where{T}
-
-    # project against cones with overly specific type, e.g. 
-    # when all of the cones are NonnegativeConeT
-    cones = convert(Vector{SupportedCone},cones)
-
-    #sanity check problem dimensions
-    _check_dimensions(P,q,A,b,cones)
-
-    #make this first to create the timers
-    s.info    = DefaultInfo{T}()
-
-    @timeit s.timers "setup!" begin
-
-        #GPU preprocess
-        s.use_gpu = gpu_preprocess(s.settings)
-        use_full = s.use_gpu      #default gpu mapping type
-
-        # user facing results go here  
-        s.solution = DefaultSolution{T}(A.n,A.m,s.use_gpu)
-
-        # presolve / chordal decomposition if needed,
-        # then take an internal copy of the problem data
-        @timeit s.timers "presolve" begin
-            s.data = DefaultProblemData{T}(P,q,A,b,cones,s.settings)
-        end 
-
-        cpucones  = CompositeCone{T}(s.data.cones,use_full)
-        s.cones  = s.use_gpu ? CompositeConeGPU{T}(cpucones) : cpucones
-
-        s.data.m == s.cones.numel || throw(DimensionMismatch())
-
-        s.variables = DefaultVariables{T}(s.data.n,s.data.m,s.use_gpu)
-        s.residuals = DefaultResiduals{T}(s.data.n,s.data.m,s.use_gpu)
-
-        #equilibrate problem data immediately on setup.
-        #this prevents multiple equlibrations if solve!
-        #is called more than once.
-        @timeit s.timers "equilibration" begin
-            data_equilibrate!(s.data,cpucones,s.settings)
-        end
-      
-        @timeit s.timers "kkt init" begin
-            if s.use_gpu
-                gpu_data_copy!(s.data)  #YC: copy data to GPU, should be optimized later
-                s.kktsystem = DefaultKKTSystemGPU{T}(s.data,cpucones,s.settings)
-            else
-                s.kktsystem = DefaultKKTSystem{T}(s.data,s.cones,s.settings)
-            end
-        end
-
-        # work variables for assembling step direction LHS/RHS
-        s.step_rhs  = DefaultVariables{T}(s.data.n,s.data.m,s.use_gpu)
-        s.step_lhs  = DefaultVariables{T}(s.data.n,s.data.m,s.use_gpu)
-
-        # a saved copy of the previous iterate
-        s.prev_vars = DefaultVariables{T}(s.data.n,s.data.m,s.use_gpu)
-
-    end
-
-    return s
-end
-
-# sanity check problem dimensions passed by user
-
-function _check_dimensions(P,q,A,b,cones)
-
-    n = length(q)
-    m = length(b)
-    p = sum(cone -> nvars(cone), cones; init = 0)
-
-    m == size(A)[1] || throw(DimensionMismatch("A and b incompatible dimensions."))
-    p == m          || throw(DimensionMismatch("Constraint dimensions inconsistent with size of cones."))
-    n == size(A)[2] || throw(DimensionMismatch("A and q incompatible dimensions."))
-    n == size(P)[1] || throw(DimensionMismatch("P and q incompatible dimensions."))
-    size(P)[1] == size(P)[2] || throw(DimensionMismatch("P not square."))
-
-end
-
-
-# an enum for reporting strategy checkpointing
-@enum StrategyCheckpoint begin 
-    Update = 0   # Checkpoint is suggesting a new ScalingStrategy
-    NoUpdate     # Checkpoint recommends no change to ScalingStrategy
-    Fail         # Checkpoint found a problem but no more ScalingStrategies to try
-end
-
-
-# -------------------------------------
-# solve!
-# -------------------------------------
-
-"""
-	solve!(solver)
-
-Computes the solution to the problem in a `Clarabel.Solver` previously defined in [`setup!`](@ref).
-"""
-function solve!(
-    s::Solver{T}
-) where{T}
-
-    # initialization needed for first loop pass 
-    iter   = 0
-    σ = one(T) 
-    α = zero(T)
-    μ = typemax(T)
-
-    #select functions depending on devices
-    use_gpu = s.use_gpu
-    residual_update = use_gpu ? residuals_update_gpu! : residuals_update!
-    info_update     = use_gpu ? info_update_gpu! : info_update!
-
-    # solver release info, solver config
-    # problem dimensions, cone type etc
-    @notimeit begin
-        print_banner(s.settings.verbose)
-        info_print_configuration(s.info,s.settings,s.data,s.cones)
-        info_print_status_header(s.info,s.settings)
-    end
-
-    info_reset!(s.info,s.timers)
-
-    @timeit s.timers "solve!" begin
-
-        # initialize variables to some reasonable starting point
-        @timeit s.timers "default start" solver_default_start!(s)
-
-        @timeit s.timers "IP iteration" begin
-
-        # ----------
-        #  main loop
-        # ----------
-
-        # Scaling strategy
-        scaling = allows_primal_dual_scaling(s.cones) ? PrimalDual::ScalingStrategy : Dual::ScalingStrategy;
-
-        while true
-
-            #update the residuals
-            #--------------
-            @timeit s.timers "residual update" residual_update(s.residuals,s.variables,s.data)
-
-            #calculate duality gap (scaled)
-            #--------------
-            @timeit s.timers "update μ" μ = variables_calc_mu(s.variables, s.residuals, s.cones)
-
-            # record scalar values from most recent iteration.
-            # This captures μ at iteration zero.  
-            info_save_scalars(s.info, μ, α, σ, iter)
-
-            #convergence check and printing
-            #--------------
-
-            @timeit s.timers "info update" info_update(
-                s.info,s.data,s.variables,
-                s.residuals,s.kktsystem,s.settings,s.timers
-            )
-            @notimeit info_print_status(s.info,s.settings)
-            isdone = info_check_termination!(s.info,s.residuals,s.settings,iter)
-
-            # check for termination due to slow progress and update strategy
-            if isdone
-                (action,scaling) = _strategy_checkpoint_insufficient_progress(s,scaling,use_gpu) 
-                if     action ∈ [NoUpdate,Fail]; break;
-                elseif action === Update; continue; 
-                end
-            end # allows continuation if new strategy provided
-
-            
-            #update the scalings
-            #--------------
-            @timeit s.timers "scale cones" begin
-            is_scaling_success = variables_scale_cones!(s.variables,s.cones,μ,scaling)
-            end
-
-            # check whether variables are interior points
-            (action,scaling) = _strategy_checkpoint_is_scaling_success(s,is_scaling_success,scaling)
-            if action === Fail;  break;
-            else ();  # we only expect NoUpdate or Fail here
-            end
-                
-
-            #increment counter here because we only count
-            #iterations that produce a KKT update 
-            iter += 1
-
-
-            #Update the KKT system and the constant parts of its solution.
-            #Keep track of the success of each step that calls KKT
-            #--------------
-
-            @timeit s.timers "kkt update" begin
-            is_kkt_solve_success = kkt_update!(s.kktsystem,s.data,s.cones)
-            end
-
-            #calculate the affine step
-            #--------------
-            @timeit s.timers "update affine step" variables_affine_step_rhs!(
-                s.step_rhs, s.residuals,
-                s.variables, s.cones
-            )
-
-            @timeit s.timers "kkt solve" begin
-            is_kkt_solve_success = is_kkt_solve_success && 
-                kkt_solve!(
-                    s.kktsystem, s.step_lhs, s.step_rhs,
-                    s.data, s.variables, s.cones, :affine
-                )
-            end
-
-            # combined step only on affine step success 
-            if is_kkt_solve_success
-
-                #calculate step length and centering parameter
-                #--------------
-                @timeit s.timers "affine step size" α = solver_get_step_length(s,:affine,scaling,use_gpu)
-                σ = _calc_centering_parameter(α)
-
-                #make a reduced Mehrotra correction in the first iteration
-                #to accommodate badly centred starting points
-                m = iter > 1 ? one(T) : α;
-
-                #calculate the combined step and length
-                #--------------
-                @timeit s.timers "update combined step" variables_combined_step_rhs!(
-                    s.step_rhs, s.residuals,
-                    s.variables, s.cones,
-                    s.step_lhs, σ, μ, m
-                )
-
-                @timeit s.timers "kkt solve" begin
-                is_kkt_solve_success =
-                    kkt_solve!(
-                        s.kktsystem, s.step_lhs, s.step_rhs,
-                        s.data, s.variables, s.cones, :combined
-                    )
-                end
-
-            end
-
-            # check for numerical failure and update strategy
-            (action,scaling) = _strategy_checkpoint_numerical_error(s, is_kkt_solve_success, scaling) 
-            if     action === NoUpdate; ();  #just keep going 
-            elseif action === Update; α = zero(T); continue; 
-            elseif action === Fail;   α = zero(T); break; 
-            end
-    
-
-            #compute final step length and update the current iterate
-            #--------------
-            @timeit s.timers "combined step size" α = solver_get_step_length(s,:combined,scaling,use_gpu)
-
-            # check for undersized step and update strategy
-            (action,scaling) = _strategy_checkpoint_small_step(s, α, scaling)
-            if     action === NoUpdate; ();  #just keep going 
-            elseif action === Update; α = zero(T); continue; 
-            elseif action === Fail;   α = zero(T); break; 
-            end 
-
-            # Copy previous iterate in case the next one is a dud
-            info_save_prev_iterate(s.info,s.variables,s.prev_vars,use_gpu)
-
-            # @timeit s.timers "final update" variables_add_step!(s.variables,s.step_lhs,α)
-            @timeit s.timers "final update" variables_add_step!(s.variables,s.step_lhs,α,use_gpu)
-
-        end  #end while
-        #----------
-        #----------
-
-        end #end IP iteration timer
-
-    end #end solve! timer
-
-    # Check we if actually took a final step.  If not, we need 
-    # to recapture the scalars and print one last line 
-    if(α == zero(T))
-        info_save_scalars(s.info, μ, α, σ, iter)
-        @notimeit info_print_status(s.info,s.settings)
-    end 
-
-    @timeit s.timers "post-process" begin
-        #check for "almost" convergence checks and then extract solution
-        info_post_process!(s.info,s.residuals,s.settings) 
-        solution_post_process!(s.solution,s.data,s.variables,s.info,s.settings,use_gpu)
-    end 
-    
-    #halt timers
-    info_finalize!(s.info,s.timers) 
-    solution_finalize!(s.solution,s.info)
-    
-
-    @notimeit info_print_footer(s.info,s.settings)
-
-    return s.solution
-end
-
-
-function solver_default_start!(s::Solver{T}) where {T}
-
-    # If there are only symmetric cones, use CVXOPT style initilization
-    # Otherwise, initialize along central rays
-
-    if (is_symmetric(s.cones))
-        #set all scalings to identity (or zero for the zero cone)
-        set_identity_scaling!(s.cones)
-        #Refactor
-        kkt_update!(s.kktsystem,s.data,s.cones)
-        #solve for primal/dual initial points via KKT
-        kkt_solve_initial_point!(s.kktsystem,s.variables,s.data)
-        #fix up (z,s) so that they are in the cone
-        variables_symmetric_initialization!(s.variables, s.cones)
-
-    else
-        #Assigns unit (z,s) and zeros the primal variables 
-        variables_unit_initialization!(s.variables, s.cones)
-    end
-
-    return nothing
-end
-
-
-function solver_get_step_length(s::Solver{T},steptype::Symbol,scaling::ScalingStrategy,use_gpu::Bool) where{T}
-
-    # step length to stay within the cones
-    α = variables_calc_step_length(
-        s.variables, s.step_lhs,
-        s.cones, s.settings, steptype
-    )
-
-    # additional barrier function limits for asymmetric cones
-    if (!is_symmetric(s.cones) && steptype == :combined && scaling == Dual::ScalingStrategy)
-        αinit = α
-        α = solver_backtrack_step_to_barrier(s, αinit)
-        # α = solver_backtrack_step_to_centrality(s,αinit)
-    end
-    return α
-end
-
-
-# check the distance to the boundary for asymmetric cones
-function solver_backtrack_step_to_barrier(
-    s::Solver{T}, αinit::T
-) where {T}
-
-    step = s.settings.linesearch_backtrack_step
-    α = αinit
-
-    for j = 1:1
-        barrier = variables_barrier(s.variables,s.step_lhs,α,s.cones)
-        if barrier < one(T)
-            return α
-        else
-            α = step*α   #backtrack line search
-        end
-    end
-
-    return α
-end
-
-# check the distance to the boundary for asymmetric cones
-function solver_backtrack_step_to_centrality(
-    s::Solver{T}, αinit::T
-) where {T}
-
-    step = s.settings.linesearch_backtrack_step
-    α_min = s.settings.min_terminate_step_length
-
-    α = αinit
-
-    for j = 1:50
-        centrality = shadow_centrality_check(s.variables,s.step_lhs,α,s.cones,s.settings.neighborhood) 
-
-        if centrality
-            return α
-        else
-            if (α *= step) < α_min
-                α = zero(T)
-                break
-            end
-        end
-    end
-
-    return α
-end
-
-# Mehrotra heuristic
-function _calc_centering_parameter(α::T) where{T}
-
-    return σ = (1-α)^3
-end
-
-
-
-function _strategy_checkpoint_insufficient_progress(s::Solver{T},scaling::ScalingStrategy,use_gpu::Bool) where {T} 
-
-    if s.info.status != INSUFFICIENT_PROGRESS
-        # there is no problem, so nothing to do
-        return (NoUpdate::StrategyCheckpoint, scaling)
-    else 
-        #recover old iterate since "insufficient progress" often 
-        #involves actual degradation of results 
-        info_reset_to_prev_iterate(s.info,s.variables,s.prev_vars,use_gpu)
-
-        # If problem is asymmetric, we can try to continue with the dual-only strategy
-        if !is_symmetric(s.cones) && (scaling == PrimalDual::ScalingStrategy)
-            s.info.status = UNSOLVED
-            return (Update::StrategyCheckpoint, Dual::ScalingStrategy)
-        else
-            return (Fail::StrategyCheckpoint, scaling)
-        end
-    end
-
-end 
-
-
-function _strategy_checkpoint_numerical_error(s::Solver{T}, is_kkt_solve_success::Bool, scaling::ScalingStrategy) where {T}
-
-    # if kkt was successful, then there is nothing to do 
-    if is_kkt_solve_success
-        return (NoUpdate::StrategyCheckpoint, scaling)
-    end
-    # If problem is asymmetric, we can try to continue with the dual-only strategy
-    if !is_symmetric(s.cones) && (scaling == PrimalDual::ScalingStrategy)
-        return (Update::StrategyCheckpoint, Dual::ScalingStrategy)
-    else
-        #out of tricks.  Bail out with an error
-        s.info.status = NUMERICAL_ERROR
-        return (Fail::StrategyCheckpoint,scaling)
-    end
-end 
-
-
-function _strategy_checkpoint_small_step(s::Solver{T}, α::T, scaling::ScalingStrategy) where {T}
-
-    if !is_symmetric(s.cones) &&
-        scaling == PrimalDual::ScalingStrategy && α < s.settings.min_switch_step_length
-        return (Update::StrategyCheckpoint, Dual::ScalingStrategy)
-
-    elseif α <= max(zero(T), s.settings.min_terminate_step_length)
-        s.info.status = INSUFFICIENT_PROGRESS
-        return (Fail::StrategyCheckpoint,scaling)
-
-    else
-        return (NoUpdate::StrategyCheckpoint,scaling)
-    end 
-end 
-
-function _strategy_checkpoint_is_scaling_success(s::Solver{T}, is_scaling_success::Bool, scaling::ScalingStrategy) where {T}
-    if is_scaling_success
-        return (NoUpdate::StrategyCheckpoint,scaling)
-    else
-        s.info.status = NUMERICAL_ERROR
-        return (Fail::StrategyCheckpoint,scaling)
-    end
-end
-
-# printing 
-
-function Base.show(io::IO, solver::Clarabel.Solver{T}) where {T}
-    println(io, "Clarabel model with Float precision: $(T)")
-end
-
-
-
-# -------------------------------------
-# getters accessing individual fields via function calls.
-# this is necessary because it allows us to use multiple
-# dispatch through these calls to access internal solver
-# data within the MOI interface, which must also support
-# the ClarabelRs wrappers
-# -------------------------------------
-
-get_solution(s::Solver{T}) where {T} = s.solution
-get_info(s::Solver{T}) where {T} = s.info
-
-#gpu preprocess, reset the static regularization
-function gpu_preprocess(
-    settings::Settings{T}
-) where {T}
-
-    #Reset the value of static regularization
-    if settings.direct_solve_method == :cudssmixed
-        @assert(T === Float64)           #
-        settings.static_regularization_constant = sqrt(eps(Float32))
-    end
-
-    return (settings.direct_kkt_solver && (settings.direct_solve_method in gpu_solver_list))
-end
-
-#copy data from CPU to GPU
-function gpu_data_copy!(data::DefaultProblemData{T}) where{T}
-    data.P_gpu = CuSparseMatrixCSR(data.P)
-    data.q_gpu = unsafe_wrap(CuArray{T,1},data.q)
-    data.A_gpu = CuSparseMatrixCSR(data.A)
-    data.At_gpu = CuSparseMatrixCSR(data.A')
-    data.b_gpu = unsafe_wrap(CuArray{T,1},data.b)
-end
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <cassert>
+#include <cuda_runtime.h>
+#include <cusparse.h>
+#include <cublas_v2.h>
+#include <cusolverDn.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/copy.h>
+#include <thrust/fill.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/for_each.h>
+#include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/inner_product.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/transform_scan.h>
+#include <thrust/sequence.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/zip_function.h>
+
+template <typename T>
+class Solver {
+public:
+    Solver() = default;
+
+    void setup(const thrust::device_vector<T>& P, const thrust::device_vector<T>& c, const thrust::device_vector<T>& A, const thrust::device_vector<T>& b, const std::vector<SupportedCone>& cones, const Settings<T>& settings) {
+        this->settings = settings;
+        setup(P, c, A, b, cones);
+    }
+
+    void setup(const thrust::device_vector<T>& P, const thrust::device_vector<T>& c, const thrust::device_vector<T>& A, const thrust::device_vector<T>& b, const std::vector<SupportedCone>& cones) {
+        settings_populate(settings, {});
+        setup(P, c, A, b, cones);
+    }
+
+    void setup(const thrust::device_vector<T>& P, const thrust::device_vector<T>& c, const thrust::device_vector<T>& A, const thrust::device_vector<T>& b, const std::vector<SupportedCone>& cones) {
+        // project against cones with overly specific type, e.g.
+        // when all of the cones are NonnegativeConeT
+        auto converted_cones = convert(cones);
+
+        // sanity check problem dimensions
+        check_dimensions(P, c, A, b, converted_cones);
+
+        // make this first to create the timers
+        info = DefaultInfo<T>();
+
+        // GPU preprocess
+        use_gpu = gpu_preprocess(settings);
+        bool use_full = use_gpu; // default gpu mapping type
+
+        // user facing results go here
+        solution = DefaultSolution<T>(A.size(), b.size(), use_gpu);
+
+        // presolve / chordal decomposition if needed,
+        // then take an internal copy of the problem data
+        data = DefaultProblemData<T>(P, c, A, b, converted_cones, settings);
+
+        CompositeCone<T> cpucones(data.cones, use_full);
+        cones = use_gpu ? CompositeConeGPU<T>(cpucones) : cpucones;
+
+        if (data.m != cones.numel()) {
+            throw std::runtime_error("DimensionMismatch");
+        }
+
+        variables = DefaultVariables<T>(data.n, data.m, use_gpu);
+        residuals = DefaultResiduals<T>(data.n, data.m, use_gpu);
+
+        // equilibrate problem data immediately on setup.
+        // this prevents multiple equlibrations if solve!
+        // is called more than once.
+        data_equilibrate(data, cpucones, settings);
+
+        if (use_gpu) {
+            gpu_data_copy(data); // YC: copy data to GPU, should be optimized later
+            kktsystem = DefaultKKTSystemGPU<T>(data, cpucones, settings);
+        } else {
+            kktsystem = DefaultKKTSystem<T>(data, cones, settings);
+        }
+
+        // work variables for assembling step direction LHS/RHS
+        step_rhs = DefaultVariables<T>(data.n, data.m, use_gpu);
+        step_lhs = DefaultVariables<T>(data.n, data.m, use_gpu);
+
+        // a saved copy of the previous iterate
+        prev_vars = DefaultVariables<T>(data.n, data.m, use_gpu);
+    }
+
+    DefaultSolution<T> solve() {
+        // initialization needed for first loop pass
+        int iter = 0;
+        T σ = 1;
+        T α = 0;
+        T μ = std::numeric_limits<T>::max();
+
+        // select functions depending on devices
+        bool use_gpu = this->use_gpu;
+        auto residual_update = use_gpu ? residuals_update_gpu : residuals_update;
+        auto info_update = use_gpu ? info_update_gpu : info_update;
+
+        // solver release info, solver config
+        // problem dimensions, cone type etc
+        print_banner(settings.verbose);
+        info_print_configuration(info, settings, data, cones);
+        info_print_status_header(info, settings);
+
+        info_reset(info, timers);
+
+        // initialize variables to some reasonable starting point
+        solver_default_start();
+
+        // main loop
+        ScalingStrategy scaling = allows_primal_dual_scaling(cones) ? PrimalDual::ScalingStrategy : Dual::ScalingStrategy;
+
+        while (true) {
+            // update the residuals
+            residual_update(residuals, variables, data);
+
+            // calculate duality gap (scaled)
+            μ = variables_calc_mu(variables, residuals, cones);
+
+            // record scalar values from most recent iteration.
+            // This captures μ at iteration zero.
+            info_save_scalars(info, μ, α, σ, iter);
+
+            // convergence check and printing
+            info_update(info, data, variables, residuals, kktsystem, settings, timers);
+            info_print_status(info, settings);
+            bool isdone = info_check_termination(info, residuals, settings, iter);
+
+            // check for termination due to slow progress and update strategy
+            if (isdone) {
+                auto [action, new_scaling] = strategy_checkpoint_insufficient_progress(scaling, use_gpu);
+                if (action == NoUpdate || action == Fail) {
+                    break;
+                } else if (action == Update) {
+                    continue;
+                }
+            }
+
+            // update the scalings
+            bool is_scaling_success = variables_scale_cones(variables, cones, μ, scaling);
+
+            // check whether variables are interior points
+            auto [action, new_scaling] = strategy_checkpoint_is_scaling_success(is_scaling_success, scaling);
+            if (action == Fail) {
+                break;
+            }
+
+            // increment counter here because we only count
+            // iterations that produce a KKT update
+            iter++;
+
+            // Update the KKT system and the constant parts of its solution.
+            // Keep track of the success of each step that calls KKT
+            bool is_kkt_solve_success = kkt_update(kktsystem, data, cones);
+
+            // calculate the affine step
+            variables_affine_step_rhs(step_rhs, residuals, variables, cones);
+            is_kkt_solve_success = is_kkt_solve_success && kkt_solve(kktsystem, step_lhs, step_rhs, data, variables, cones, Affine);
+
+            // combined step only on affine step success
+            if (is_kkt_solve_success) {
+                // calculate step length and centering parameter
+                α = solver_get_step_length(Affine, scaling, use_gpu);
+                σ = calc_centering_parameter(α);
+
+                // make a reduced Mehrotra correction in the first iteration
+                // to accommodate badly centred starting points
+                T m = iter > 1 ? 1 : α;
+
+                // calculate the combined step and length
+                variables_combined_step_rhs(step_rhs, residuals, variables, cones, step_lhs, σ, μ, m);
+                is_kkt_solve_success = kkt_solve(kktsystem, step_lhs, step_rhs, data, variables, cones, Combined);
+            }
+
+            // check for numerical failure and update strategy
+            auto [action, new_scaling] = strategy_checkpoint_numerical_error(is_kkt_solve_success, scaling);
+            if (action == NoUpdate) {
+                // just keep going
+            } else if (action == Update) {
+                α = 0;
+                continue;
+            } else if (action == Fail) {
+                α = 0;
+                break;
+            }
+
+            // compute final step length and update the current iterate
+            α = solver_get_step_length(Combined, scaling, use_gpu);
+
+            // check for undersized step and update strategy
+            auto [action, new_scaling] = strategy_checkpoint_small_step(α, scaling);
+            if (action == NoUpdate) {
+                // just keep going
+            } else if (action == Update) {
+                α = 0;
+                continue;
+            } else if (action == Fail) {
+                α = 0;
+                break;
+            }
+
+            // Copy previous iterate in case the next one is a dud
+            info_save_prev_iterate(info, variables, prev_vars, use_gpu);
+
+            variables_add_step(variables, step_lhs, α, use_gpu);
+        }
+
+        // Check we if actually took a final step. If not, we need
+        // to recapture the scalars and print one last line
+        if (α == 0) {
+            info_save_scalars(info, μ, α, σ, iter);
+            info_print_status(info, settings);
+        }
+
+        // check for "almost" convergence checks and then extract solution
+        info_post_process(info, residuals, settings);
+        solution_post_process(solution, data, variables, info, settings, use_gpu);
+
+        // halt timers
+        info_finalize(info, timers);
+        solution_finalize(solution, info);
+
+        info_print_footer(info, settings);
+
+        return solution;
+    }
+
+private:
+    DefaultInfo<T> info;
+    DefaultSolution<T> solution;
+    DefaultProblemData<T> data;
+    CompositeCone<T> cones;
+    DefaultVariables<T> variables;
+    DefaultResiduals<T> residuals;
+    DefaultVariables<T> step_rhs;
+    DefaultVariables<T> step_lhs;
+    DefaultVariables<T> prev_vars;
+    DefaultKKTSystem<T> kktsystem;
+    Settings<T> settings;
+    bool use_gpu;
+
+    void solver_default_start() {
+        if (is_symmetric(cones)) {
+            set_identity_scaling(cones);
+            kkt_update(kktsystem, data, cones);
+            kkt_solve_initial_point(kktsystem, variables, data);
+            variables_symmetric_initialization(variables, cones);
+        } else {
+            variables_unit_initialization(variables, cones);
+        }
+    }
+
+    T solver_get_step_length(StepType steptype, ScalingStrategy scaling, bool use_gpu) {
+        T α = variables_calc_step_length(variables, step_lhs, cones, settings, steptype);
+
+        if (!is_symmetric(cones) && steptype == Combined && scaling == Dual::ScalingStrategy) {
+            T αinit = α;
+            α = solver_backtrack_step_to_barrier(αinit);
+        }
+
+        return α;
+    }
+
+    T solver_backtrack_step_to_barrier(T αinit) {
+        T step = settings.linesearch_backtrack_step;
+        T α = αinit;
+
+        for (int j = 0; j < 1; ++j) {
+            T barrier = variables_barrier(variables, step_lhs, α, cones);
+            if (barrier < 1) {
+                return α;
+            } else {
+                α = step * α; // backtrack line search
+            }
+        }
+
+        return α;
+    }
+
+    T calc_centering_parameter(T α) {
+        return std::pow(1 - α, 3);
+    }
+
+    std::pair<StrategyCheckpoint, ScalingStrategy> strategy_checkpoint_insufficient_progress(ScalingStrategy scaling, bool use_gpu) {
+        if (info.status != INSUFFICIENT_PROGRESS) {
+            return {NoUpdate, scaling};
+        } else {
+            info_reset_to_prev_iterate(info, variables, prev_vars, use_gpu);
+
+            if (!is_symmetric(cones) && scaling == PrimalDual::ScalingStrategy) {
+                info.status = UNSOLVED;
+                return {Update, Dual::ScalingStrategy};
+            } else {
+                return {Fail, scaling};
+            }
+        }
+    }
+
+    std::pair<StrategyCheckpoint, ScalingStrategy> strategy_checkpoint_numerical_error(bool is_kkt_solve_success, ScalingStrategy scaling) {
+        if (is_kkt_solve_success) {
+            return {NoUpdate, scaling};
+        }
+
+        if (!is_symmetric(cones) && scaling == PrimalDual::ScalingStrategy) {
+            return {Update, Dual::ScalingStrategy};
+        } else {
+            info.status = NUMERICAL_ERROR;
+            return {Fail, scaling};
+        }
+    }
+
+    std::pair<StrategyCheckpoint, ScalingStrategy> strategy_checkpoint_small_step(T α, ScalingStrategy scaling) {
+        if (!is_symmetric(cones) && scaling == PrimalDual::ScalingStrategy && α < settings.min_switch_step_length) {
+            return {Update, Dual::ScalingStrategy};
+        } else if (α <= std::max(static_cast<T>(0), settings.min_terminate_step_length)) {
+            info.status = INSUFFICIENT_PROGRESS;
+            return {Fail, scaling};
+        } else {
+            return {NoUpdate, scaling};
+        }
+    }
+
+    std::pair<StrategyCheckpoint, ScalingStrategy> strategy_checkpoint_is_scaling_success(bool is_scaling_success, ScalingStrategy scaling) {
+        if (is_scaling_success) {
+            return {NoUpdate, scaling};
+        } else {
+            info.status = NUMERICAL_ERROR;
+            return {Fail, scaling};
+        }
+    }
+};
+
+template <typename T>
+bool gpu_preprocess(Settings<T>& settings) {
+    if (settings.direct_solve_method == "cudssmixed") {
+        assert(std::is_same<T, double>::value);
+        settings.static_regularization_constant = std::sqrt(std::numeric_limits<float>::epsilon());
+    }
+
+    return settings.direct_kkt_solver && (std::find(gpu_solver_list.begin(), gpu_solver_list.end(), settings.direct_solve_method) != gpu_solver_list.end());
+}
+
+template <typename T>
+void gpu_data_copy(DefaultProblemData<T>& data) {
+    data.P_gpu = CuSparseMatrixCSR(data.P);
+    data.q_gpu = thrust::device_vector<T>(data.q.begin(), data.q.end());
+    data.A_gpu = CuSparseMatrixCSR(data.A);
+    data.At_gpu = CuSparseMatrixCSR(data.A.transpose());
+    data.b_gpu = thrust::device_vector<T>(data.b.begin(), data.b.end());
+}

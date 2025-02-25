@@ -1,240 +1,163 @@
-# ---------------
-# KKT System
-# ---------------
+#include <vector>
+#include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/inner_product.h>
+#include <thrust/copy.h>
+#include <thrust/fill.h>
+#include <thrust/for_each.h>
+#include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
+#include <thrust/sequence.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/zip_function.h>
 
-mutable struct DefaultKKTSystemGPU{T} <: AbstractKKTSystem{T}
+template <typename T>
+class DefaultKKTSystemGPU {
+public:
+    // the KKT system solver
+    AbstractKKTSolver<T> kktsolver;
 
-    #the KKT system solver
-    kktsolver::AbstractKKTSolver{T}
+    // solution vector for constant part of KKT solves
+    thrust::device_vector<T> x1;
+    thrust::device_vector<T> z1;
 
-    #solution vector for constant part of KKT solves
-    x1::AbstractVector{T}
-    z1::AbstractVector{T}
+    // solution vector for general KKT solves
+    thrust::device_vector<T> x2;
+    thrust::device_vector<T> z2;
 
-    #solution vector for general KKT solves
-    x2::AbstractVector{T}
-    z2::AbstractVector{T}
-    
-    #work vectors for assembling/disassembling vectors
-    workx::AbstractVector{T}
-    workz::AbstractVector{T}
-    work_conic::AbstractVector{T}
+    // work vectors for assembling/disassembling vectors
+    thrust::device_vector<T> workx;
+    thrust::device_vector<T> workz;
+    thrust::device_vector<T> work_conic;
 
-    #temporary GPU vector for the conic part 
-    workx2::AbstractVector{T}
+    // temporary GPU vector for the conic part
+    thrust::device_vector<T> workx2;
 
-        function DefaultKKTSystemGPU{T}(
-            data::DefaultProblemData{T},
-            cones::CompositeCone{T},
-            settings::Settings{T}
-        ) where {T}
+    DefaultKKTSystemGPU(DefaultProblemData<T>& data, CompositeCone<T>& cones, Settings<T>& settings)
+        : kktsolver(GPULDLKKTSolver<T>(data.P, data.A, cones, data.m, data.n, settings)),
+          x1(data.n), z1(data.m), x2(data.n), z2(data.m),
+          workx(data.n), workz(data.m), work_conic(data.m), workx2(data.n) {}
 
-        #basic problem dimensions
-        (m, n) = (data.m, data.n)
+    bool kkt_update(DefaultProblemData<T>& data, CompositeConeGPU<T>& cones) {
+        // update the linear solver with new cones
+        bool is_success = kktsolver.update(cones);
 
-        kktsolver = GPULDLKKTSolver{T}(data.P,data.A,cones,m,n,settings)
+        // bail if the factorization has failed
+        if (!is_success) return is_success;
 
-        #the LHS constant part of the reduced solve
-        x1   = CuVector{T}(undef,n)
-        z1   = CuVector{T}(undef,m)
+        // calculate KKT solution for constant terms
+        is_success = _kkt_solve_constant_rhs(data);
 
-        #the LHS for other solves
-        x2   = CuVector{T}(undef,n)
-        z2   = CuVector{T}(undef,m)
+        return is_success;
+    }
 
-        #workspace compatible with (x,z)
-        workx   = CuVector{T}(undef,n)
-        workz   = CuVector{T}(undef,m)
+    bool _kkt_solve_constant_rhs(DefaultProblemData<T>& data) {
+        thrust::transform(data.q_gpu.begin(), data.q_gpu.end(), workx.begin(), thrust::negate<T>());
 
-        #additional conic workspace vector compatible with s and z
-        work_conic = CuVector{T}(undef,m)
+        kktsolver.set_rhs(workx, data.b_gpu);
+        bool is_success = kktsolver.solve(x2, z2);
 
-        workx2 = CuVector{T}(undef,n)
+        return is_success;
+    }
 
-        return new(kktsolver,x1,z1,x2,z2,workx,workz,work_conic,workx2)
+    bool kkt_solve_initial_point(DefaultVariables<T>& variables, DefaultProblemData<T>& data) {
+        if (data.P.nonZeros() == 0) {
+            // LP initialization
+            // solve with [0;b] as a RHS to get (x,-s) initializers
+            // zero out any sparse cone variables at end
+            thrust::fill(workx.begin(), workx.end(), T(0));
+            thrust::copy(data.b_gpu.begin(), data.b_gpu.end(), workz.begin());
+            kktsolver.set_rhs(workx, workz);
+            bool is_success = kktsolver.solve(variables.x, variables.s);
+            thrust::transform(variables.s.begin(), variables.s.end(), variables.s.begin(), thrust::negate<T>());
 
-    end
+            if (!is_success) return is_success;
 
-end
+            // solve with [-q;0] as a RHS to get z initializer
+            // zero out any sparse cone variables at end
+            thrust::transform(data.q_gpu.begin(), data.q_gpu.end(), workx.begin(), thrust::negate<T>());
+            thrust::fill(workz.begin(), workz.end(), T(0));
 
-DefaultKKTSystemGPU(args...) = DefaultKKTSystemGPU{DefaultFloat}(args...)
+            kktsolver.set_rhs(workx, workz);
+            is_success = kktsolver.solve(thrust::nullopt, variables.z);
+        } else {
+            // QP initialization
+            thrust::transform(data.q_gpu.begin(), data.q_gpu.end(), workx.begin(), thrust::negate<T>());
+            thrust::copy(data.b_gpu.begin(), data.b_gpu.end(), workz.begin());
 
-function kkt_update!(
-    kktsystem::DefaultKKTSystemGPU{T},
-    data::DefaultProblemData{T},
-    cones::CompositeConeGPU{T}
-) where {T}
+            kktsolver.set_rhs(workx, workz);
+            bool is_success = kktsolver.solve(variables.x, variables.z);
+            thrust::transform(variables.z.begin(), variables.z.end(), variables.s.begin(), thrust::negate<T>());
+        }
 
-    #update the linear solver with new cones
-    is_success  = kktsolver_update!(kktsystem.kktsolver,cones)
+        return is_success;
+    }
 
-    #bail if the factorization has failed 
-    is_success || return is_success
+    bool kkt_solve(DefaultVariables<T>& lhs, DefaultVariables<T>& rhs, DefaultProblemData<T>& data, DefaultVariables<T>& variables, CompositeConeGPU<T>& cones, const std::string& steptype) {
+        // solve for (x1,z1)
+        thrust::copy(rhs.x.begin(), rhs.x.end(), workx.begin());
 
-    #calculate KKT solution for constant terms
-    is_success = _kkt_solve_constant_rhs!(kktsystem,data)
+        // compute the vector c in the step equation HₛΔz + Δs = -c,
+        // with shortcut in affine case
+        thrust::device_vector<T> Δs_const_term = work_conic;
 
-    return is_success
-end
+        if (steptype == "affine") {
+            thrust::copy(variables.s.begin(), variables.s.end(), Δs_const_term.begin());
+        } else {
+            // we can use the overall LHS output as additional workspace for the moment
+            Δs_from_Δz_offset(cones, Δs_const_term, rhs.s, lhs.z, variables.z);
+        }
 
-function _kkt_solve_constant_rhs!(
-    kktsystem::DefaultKKTSystemGPU{T},
-    data::DefaultProblemData{T}
-) where {T}
+        thrust::transform(Δs_const_term.begin(), Δs_const_term.end(), rhs.z.begin(), workz.begin(), thrust::minus<T>());
+        cudaDeviceSynchronize();
 
-    @. kktsystem.workx = -data.q_gpu;
+        // this solves the variable part of reduced KKT system
+        kktsolver.set_rhs(workx, workz);
+        bool is_success = kktsolver.solve(x1, z1);
 
-    kktsolver_setrhs!(kktsystem.kktsolver, kktsystem.workx, data.b_gpu)
-    is_success = kktsolver_solve!(kktsystem.kktsolver, kktsystem.x2, kktsystem.z2)
+        if (!is_success) return false;
 
-    return is_success
+        // solve for Δτ
+        thrust::transform(variables.x.begin(), variables.x.end(), thrust::make_constant_iterator(variables.τ), workx.begin(), thrust::divides<T>());
+        cudaDeviceSynchronize();
 
-end
+        thrust::device_vector<T> workx2 = this->workx2;
+        mul(workx2, data.P_gpu, x1);
+        T tau_num = rhs.τ - rhs.κ / variables.τ + thrust::inner_product(data.q_gpu.begin(), data.q_gpu.end(), x1.begin(), T(0)) + thrust::inner_product(data.b_gpu.begin(), data.b_gpu.end(), z1.begin(), T(0)) + 2 * thrust::inner_product(workx.begin(), workx.end(), workx2.begin(), T(0));
 
+        thrust::transform(workx.begin(), workx.end(), x2.begin(), workx.begin(), thrust::minus<T>());
+        cudaDeviceSynchronize();
 
-function kkt_solve_initial_point!(
-    kktsystem::DefaultKKTSystemGPU{T},
-    variables::DefaultVariables{T},
-    data::DefaultProblemData{T}
-) where{T}
+        T tau_den = variables.κ / variables.τ - thrust::inner_product(data.q_gpu.begin(), data.q_gpu.end(), x2.begin(), T(0)) - thrust::inner_product(data.b_gpu.begin(), data.b_gpu.end(), z2.begin(), T(0));
+        mul(workx2, data.P_gpu, workx);
+        T t1 = thrust::inner_product(workx.begin(), workx.end(), workx2.begin(), T(0));
+        mul(workx2, data.P_gpu, x2);
+        T t2 = thrust::inner_product(x2.begin(), x2.end(), workx2.begin(), T(0));
+        tau_den += t1 - t2;
 
-    if nnz(data.P) == 0
-        # LP initialization
-        # solve with [0;b] as a RHS to get (x,-s) initializers
-        # zero out any sparse cone variables at end
-        kktsystem.workx .= zero(T)
-        kktsystem.workz .= data.b_gpu
-        kktsolver_setrhs!(kktsystem.kktsolver, kktsystem.workx, kktsystem.workz)
-        is_success = kktsolver_solve!(kktsystem.kktsolver, variables.x, variables.s)
-        variables.s .= -variables.s
+        // solve for (Δx,Δz)
+        lhs.τ = tau_num / tau_den;
+        thrust::transform(x1.begin(), x1.end(), thrust::make_constant_iterator(lhs.τ), x2.begin(), lhs.x.begin(), thrust::plus<T>());
+        thrust::transform(z1.begin(), z1.end(), thrust::make_constant_iterator(lhs.τ), z2.begin(), lhs.z.begin(), thrust::plus<T>());
+        cudaDeviceSynchronize();
 
-        if !is_success return is_success end
+        // solve for Δs
+        mul_Hs(cones, lhs.s, lhs.z, workz);
+        thrust::transform(lhs.s.begin(), lhs.s.end(), Δs_const_term.begin(), lhs.s.begin(), thrust::minus<T>());
+        cudaDeviceSynchronize();
 
-        # solve with [-q;0] as a RHS to get z initializer
-        # zero out any sparse cone variables at end
-        @. kktsystem.workx = -data.q_gpu
-        kktsystem.workz .=  zero(T)
+        // solve for Δκ
+        lhs.κ = -(rhs.κ + variables.κ * lhs.τ) / variables.τ;
 
-        kktsolver_setrhs!(kktsystem.kktsolver, kktsystem.workx, kktsystem.workz)
-        is_success = kktsolver_solve!(kktsystem.kktsolver, nothing, variables.z)
-    else
-        # QP initialization
-        @. kktsystem.workx = -data.q_gpu
-        @. kktsystem.workz = data.b_gpu
-
-        kktsolver_setrhs!(kktsystem.kktsolver, kktsystem.workx, kktsystem.workz)
-        is_success = kktsolver_solve!(kktsystem.kktsolver, variables.x, variables.z)
-        @. variables.s = -variables.z
-    end
-
-    return is_success
-
-end
-
-function kkt_solve!(
-    kktsystem::DefaultKKTSystemGPU{T},
-    lhs::DefaultVariables{T},
-    rhs::DefaultVariables{T},
-    data::DefaultProblemData{T},
-    variables::DefaultVariables{T},
-    cones::CompositeConeGPU{T},
-    steptype::Symbol   #:affine or :combined
-) where{T}
-
-    (x1,z1) = (kktsystem.x1, kktsystem.z1)
-    (x2,z2) = (kktsystem.x2, kktsystem.z2)
-    (workx,workz) = (kktsystem.workx, kktsystem.workz)
-
-    #solve for (x1,z1)
-    #-----------
-    @. workx = rhs.x
-
-    # compute the vector c in the step equation HₛΔz + Δs = -c,  
-    # with shortcut in affine case
-    Δs_const_term = kktsystem.work_conic
-
-    if steptype == :affine
-        @. Δs_const_term = variables.s
-
-    else  #:combined expected, but any general RHS should do this
-        #we can use the overall LHS output as additional workspace for the moment
-        Δs_from_Δz_offset!(cones,Δs_const_term,rhs.s,lhs.z,variables.z)
-    end
-
-    @. workz = Δs_const_term - rhs.z
-    CUDA.synchronize()
-
-
-    #---------------------------------------------------
-    #this solves the variable part of reduced KKT system
-    kktsolver_setrhs!(kktsystem.kktsolver, workx, workz)
-    is_success = kktsolver_solve!(kktsystem.kktsolver,x1,z1)
-
-    if !is_success return false end
-
-    #solve for Δτ.
-    #-----------
-    # Numerator first
-    ξ   = workx
-    @. ξ = variables.x / variables.τ
-    CUDA.synchronize()
-
-    workx2 = kktsystem.workx2
-    mul!(workx2,data.P_gpu,x1)
-    tau_num = rhs.τ - rhs.κ/variables.τ + dot(data.q_gpu,x1) + dot(data.b_gpu,z1) + 2*dot(ξ,workx2)
-
-    #offset ξ for the quadratic form in the denominator
-    ξ_minus_x2    = ξ   #alias to ξ, same as workx
-    @. ξ_minus_x2  -= x2
-    CUDA.synchronize()
-
-    tau_den  = variables.κ/variables.τ - dot(data.q_gpu,x2) - dot(data.b_gpu,z2)
-    mul!(workx2,data.P_gpu,ξ_minus_x2)
-    t1 = dot(ξ_minus_x2,workx2)
-    mul!(workx2,data.P_gpu,x2)
-    t2 = dot(x2,workx2)
-    tau_den += t1 - t2
-
-    #solve for (Δx,Δz)
-    #-----------
-    lhs.τ  = tau_num/tau_den
-    @. lhs.x = x1 + lhs.τ * x2
-    @. lhs.z = z1 + lhs.τ * z2
-    CUDA.synchronize()
-
-    #solve for Δs
-    #-------------
-    # compute the linear term HₛΔz, where Hs = WᵀW for symmetric
-    # cones and Hs = μH(z) for asymmetric cones
-    mul_Hs!(cones,lhs.s,lhs.z,workz)
-    @. lhs.s = -(lhs.s + Δs_const_term)
-
-    CUDA.synchronize()
-    
-    #solve for Δκ
-    #--------------
-    lhs.κ = -(rhs.κ + variables.κ * lhs.τ) / variables.τ
-
-    # we don't check the validity of anything
-    # after the KKT solve, so just return is_success
-    # without further validation
-    return is_success
-
-end
-
-# #update the KKT system with new P and A
-# function kkt_update_P!(
-#     kktsystem::DefaultKKTSystemGPU{T},
-#     P::SparseMatrixCSC{T}
-# ) where{T}
-#     kktsolver_update_P!(kktsystem.kktsolver,P)
-#     return nothing
-# end
-
-# function kkt_update_A!(
-#     kktsystem::DefaultKKTSystemGPU{T},
-#     A::SparseMatrixCSC{T}
-# ) where{T}
-#     kktsolver_update_A!(kktsystem.kktsolver,A)
-#     return nothing
-# end
+        // we don't check the validity of anything
+        // after the KKT solve, so just return is_success
+        // without further validation
+        return is_success;
+    }
+};

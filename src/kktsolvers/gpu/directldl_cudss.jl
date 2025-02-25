@@ -1,60 +1,54 @@
-using CUDA, CUDA.CUSPARSE
-using CUDSS
+#include <cuda_runtime.h>
+#include <cusparse.h>
+#include <CUDSS/CudssSolver.h>
+#include <vector>
+#include <map>
 
-export CUDSSDirectLDLSolver
-struct CUDSSDirectLDLSolver{T} <: AbstractGPUSolver{T}
+class CUDSSDirectLDLSolver {
+public:
+    using T = float; // Assuming T is float, change if necessary
 
-    KKTgpu::AbstractSparseMatrix{T}
-    cudssSolver::CUDSS.CudssSolver{T}
-    x::AbstractVector{T}
-    b::AbstractVector{T}
-    
+    CUDSSDirectLDLSolver(const std::vector<int>& KKT, std::vector<T>& x, std::vector<T>& b)
+        : KKTgpu(KKT), x(x), b(b) {
+        int dim = KKT.size(); // Assuming KKT is a square matrix stored in a 1D vector
 
-    function CUDSSDirectLDLSolver{T}(KKT::AbstractSparseMatrix{T},x,b) where {T}
+        // make a logical factorization to fix memory allocations
+        // "S" denotes real symmetric and 'U' denotes the upper triangular
 
-        dim = LinearAlgebra.checksquare(KKT)
+        cudssSolver = CUDSS::CudssSolver<T>(KKTgpu, "S", 'F');
 
-        #make a logical factorization to fix memory allocations
-        # "S" denotes real symmetric and 'U' denotes the upper triangular
+        cudss("analysis", cudssSolver, x, b);
+        cudss("factorization", cudssSolver, x, b);
+    }
 
-        KKTgpu = KKT
-        cudssSolver = CUDSS.CudssSolver(KKTgpu, "S", 'F')
+    void refactor() {
+        // Update the KKT matrix in the cudss solver
+        cudss_set(cudssSolver.matrix, KKTgpu);
 
-        cudss("analysis", cudssSolver, x, b)
-        cudss("factorization", cudssSolver, x, b)
+        // Refactorization
+        cudss("factorization", cudssSolver, x, b);
 
-        return new(KKTgpu,cudssSolver,x,b)
-    end
+        // YC: should be corrected later on 
+        // return all(isfinite, cudss_get(ldlsolver.cudssSolver.data,"diag"))
+    }
 
-end
+    void solve(std::vector<T>& x, const std::vector<T>& b) {
+        // solve on GPU
+        ldiv(x, cudssSolver, b);
+    }
 
-GPUSolversDict[:cudss] = CUDSSDirectLDLSolver
-required_matrix_shape(::Type{CUDSSDirectLDLSolver}) = :full
+private:
+    std::vector<int> KKTgpu;
+    CUDSS::CudssSolver<T> cudssSolver;
+    std::vector<T> x;
+    std::vector<T> b;
+};
 
-#refactor the linear system
-function refactor!(ldlsolver::CUDSSDirectLDLSolver{T}) where{T}
+std::map<std::string, CUDSSDirectLDLSolver> GPUSolversDict = { {"cudss", CUDSSDirectLDLSolver()} };
 
-    # Update the KKT matrix in the cudss solver
-    cudss_set(ldlsolver.cudssSolver.matrix,ldlsolver.KKTgpu)
-
-    # Refactorization
-    cudss("factorization", ldlsolver.cudssSolver, ldlsolver.x, ldlsolver.b)
-
-    # YC: should be corrected later on 
-    return true
-    # return all(isfinite, cudss_get(ldlsolver.cudssSolver.data,"diag"))
-
-end
-
-
-#solve the linear system
-function solve!(
-    ldlsolver::CUDSSDirectLDLSolver{T},
-    x::AbstractVector{T},
-    b::AbstractVector{T}
-) where{T}
-    
-    #solve on GPU
-    ldiv!(x,ldlsolver.cudssSolver,b)
-
-end
+std::string required_matrix_shape(const std::type_info& type) {
+    if (type == typeid(CUDSSDirectLDLSolver)) {
+        return "full";
+    }
+    return "";
+}

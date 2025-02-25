@@ -1,153 +1,173 @@
+#include <vector>
+#include <cassert>
+#include <Eigen/Sparse>
+#include <Eigen/Dense>
 
-function count_soc(cone, size_soc)
+using namespace Eigen;
 
-    numel_cone = Clarabel.nvars(cone)
-    @assert(numel_cone > size_soc)
-        
-    num_socs = 1
-    numel_cone -= size_soc-1
+int count_soc(const SupportedCone& cone, int size_soc) {
+    int numel_cone = Clarabel::nvars(cone);
+    assert(numel_cone > size_soc);
 
-    while (numel_cone > size_soc-1)
-        numel_cone -= size_soc-2
-        num_socs += 1
-    end
+    int num_socs = 1;
+    numel_cone -= size_soc - 1;
 
-    num_socs += 1
+    while (numel_cone > size_soc - 1) {
+        numel_cone -= size_soc - 2;
+        num_socs += 1;
+    }
 
-    return num_socs, numel_cone+1
-end
+    num_socs += 1;
 
-#augment At,b for a large soc
-function augment_data(At0,
-    b0::Vector{T},
-    rng_row,size_soc,num_soc,last_size,augx_idx) where {T}
+    return num_socs, numel_cone + 1;
+}
 
-    At = At0[:,rng_row]
-    b = b0[rng_row]
-    (n,m) = size(At)
-    reduce_soc = size_soc - 2
-    @assert(reduce_soc > 0)
+template <typename T>
+void augment_data(const SparseMatrix<T>& At0, std::vector<T>& b0, const std::vector<int>& rng_row, int size_soc, int num_soc, int last_size, int& augx_idx, SparseMatrix<T>& Atnew, std::vector<T>& bnew, std::vector<SupportedCone>& conenew) {
+    SparseMatrix<T> At = At0.middleCols(rng_row[0], rng_row.size());
+    std::vector<T> b(rng_row.size());
+    for (size_t i = 0; i < rng_row.size(); ++i) {
+        b[i] = b0[rng_row[i]];
+    }
 
-    bnew = sizehint!(T[],m + 2*(num_soc-1))
-    conenew = sizehint!(Clarabel.SupportedCone[],num_soc)
+    int n = At.rows();
+    int m = At.cols();
+    int reduce_soc = size_soc - 2;
+    assert(reduce_soc > 0);
 
-    Atnew = At[:,1]
-    push!(bnew,b[1])
-    idx = 1             #complete index
-    for i in 1:num_soc
-        if i == num_soc
-            rng = idx+1:idx+last_size-1
-            Atnew = hcat(Atnew,At[:,rng])
-            @views append!(bnew,b[rng])
-            push!(conenew, Clarabel.SecondOrderConeT(last_size))
-        else
-            rng = idx+1:idx+reduce_soc
-            Atnew = hcat(Atnew,At[:,rng])
-            @views append!(bnew,b[rng])
-            push!(conenew, Clarabel.SecondOrderConeT(size_soc))
+    bnew.reserve(m + 2 * (num_soc - 1));
+    conenew.reserve(num_soc);
 
-            idx += reduce_soc
-            augx_idx += 1
-            Atnew = hcat(Atnew,sparse([augx_idx, augx_idx],[1,2],[-1,-1],n,2))
-            @views append!(bnew,[0,0])
-        end
-    end
+    Atnew = At.middleCols(0, 1);
+    bnew.push_back(b[0]);
+    int idx = 1;
 
-    return Atnew, bnew, conenew, augx_idx
-end
+    for (int i = 1; i <= num_soc; ++i) {
+        if (i == num_soc) {
+            std::vector<int> rng(idx + 1, idx + last_size - 1);
+            Atnew.conservativeResize(Atnew.rows(), Atnew.cols() + rng.size());
+            Atnew.middleCols(Atnew.cols() - rng.size(), rng.size()) = At.middleCols(rng[0], rng.size());
+            bnew.insert(bnew.end(), b.begin() + rng[0], b.begin() + rng[0] + rng.size());
+            conenew.push_back(Clarabel::SecondOrderConeT(last_size));
+        } else {
+            std::vector<int> rng(idx + 1, idx + reduce_soc);
+            Atnew.conservativeResize(Atnew.rows(), Atnew.cols() + rng.size());
+            Atnew.middleCols(Atnew.cols() - rng.size(), rng.size()) = At.middleCols(rng[0], rng.size());
+            bnew.insert(bnew.end(), b.begin() + rng[0], b.begin() + rng[0] + rng.size());
+            conenew.push_back(Clarabel::SecondOrderConeT(size_soc));
 
-function augment_A_b_soc(
-    cones::Vector{SupportedCone},
-    P::AbstractMatrix{T},
-    q::Vector{T},
-    A::AbstractMatrix{T},
-    b::Vector{T},
-    size_soc::Int64,
-    num_socs::Vector{Int}, 
-    last_sizes::Vector{Int}, 
-    soc_indices::Vector{Int}, 
-    soc_starts::Vector{Int}
-) where {T}
+            idx += reduce_soc;
+            augx_idx += 1;
+            Atnew.conservativeResize(Atnew.rows(), Atnew.cols() + 2);
+            Atnew.middleCols(Atnew.cols() - 2, 2) = SparseMatrix<T>(n, 2);
+            Atnew.coeffRef(augx_idx, Atnew.cols() - 2) = -1;
+            Atnew.coeffRef(augx_idx, Atnew.cols() - 1) = -1;
+            bnew.push_back(0);
+            bnew.push_back(0);
+        }
+    }
+}
 
-    (m,n) = size(A)
-    
-    extra_dim = sum(num_socs) - length(num_socs)    #Additional dimensionality for x
+template <typename T>
+void augment_A_b_soc(std::vector<SupportedCone>& cones, SparseMatrix<T>& P, std::vector<T>& q, SparseMatrix<T>& A, std::vector<T>& b, int size_soc, std::vector<int>& num_socs, std::vector<int>& last_sizes, std::vector<int>& soc_indices, std::vector<int>& soc_starts) {
+    int m = A.rows();
+    int n = A.cols();
 
-    At = vcat(SparseMatrixCSC(A'), spzeros(extra_dim,m))        #May be costly, but more efficient to add rows to a SparseCSR matrix
-    bnew = sizehint!(T[],m + 2*extra_dim)
-    conesnew = sizehint!(Clarabel.SupportedCone[],length(cones) + extra_dim)
+    int extra_dim = std::accumulate(num_socs.begin(), num_socs.end(), 0) - num_socs.size();
 
-    Atnew = spzeros(n+extra_dim,0)
+    SparseMatrix<T> At(n + extra_dim, m);
+    At.topRows(n) = A.transpose();
+    At.bottomRows(extra_dim).setZero();
 
-    start_idx = 0
-    end_idx = 0
-    cone_idx = 0
-    augx_idx = n    #the pointer to the auxiliary x used so far
-    
-    for (i,ind) in enumerate(soc_indices)
+    std::vector<T> bnew;
+    bnew.reserve(m + 2 * extra_dim);
+    std::vector<SupportedCone> conesnew;
+    conesnew.reserve(cones.size() + extra_dim);
 
-        @views append!(conesnew, cones[cone_idx+1:ind-1])
+    SparseMatrix<T> Atnew(n + extra_dim, 0);
 
-        numel_cone = Clarabel.nvars(cones[ind])
+    int start_idx = 0;
+    int end_idx = 0;
+    int cone_idx = 0;
+    int augx_idx = n;
 
-        end_idx = soc_starts[i]
+    for (size_t i = 0; i < soc_indices.size(); ++i) {
+        int ind = soc_indices[i];
 
-        rng = start_idx+1:end_idx
-        @views Atnew = hcat(Atnew, At[:,rng])
-        @views append!(bnew,b[rng])
+        conesnew.insert(conesnew.end(), cones.begin() + cone_idx, cones.begin() + ind);
 
-        start_idx = end_idx
-        end_idx += numel_cone
-        rng_cone = start_idx+1:end_idx
+        int numel_cone = Clarabel::nvars(cones[ind]);
 
-        Ati,bi,conesi,augx_idx = augment_data(At, b, rng_cone,size_soc,num_socs[i],last_sizes[i],augx_idx)        #augment the current large soc
+        end_idx = soc_starts[i];
 
-        Atnew = hcat(Atnew, Ati)
-        append!(bnew,bi)
-        append!(conesnew,conesi)
+        std::vector<int> rng(start_idx + 1, end_idx);
+        Atnew.conservativeResize(Atnew.rows(), Atnew.cols() + rng.size());
+        Atnew.middleCols(Atnew.cols() - rng.size(), rng.size()) = At.middleCols(rng[0], rng.size());
+        bnew.insert(bnew.end(), b.begin() + rng[0], b.begin() + rng[0] + rng.size());
 
-        start_idx = end_idx
-        cone_idx = ind
-    end
-    
-    if (cone_idx< length(cones))
-        @views Atnew = hcat(Atnew, At[:,start_idx+1:end])
-        @views append!(bnew,b[start_idx+1:end])
-        @views append!(conesnew, cones[cone_idx+1:end])
-    end
+        start_idx = end_idx;
+        end_idx += numel_cone;
+        std::vector<int> rng_cone(start_idx + 1, end_idx);
 
-    Pnew = hcat(vcat(P,spzeros(extra_dim,n)),spzeros(n+extra_dim,extra_dim))
-    return Pnew,vcat(q,zeros(extra_dim)),SparseMatrixCSC(Atnew'), bnew, conesnew
-end
+        SparseMatrix<T> Ati;
+        std::vector<T> bi;
+        std::vector<SupportedCone> conesi;
+        augment_data(At, b, rng_cone, size_soc, num_socs[i], last_sizes[i], augx_idx, Ati, bi, conesi);
 
-function expand_soc(
-    cones::Vector{SupportedCone},
-    size_soc::Int64
-)
-    n_large_soc = 0
-    soc_indices = sizehint!(Int[],length(cones))            #Indices of large second-order cones 
-    soc_starts = sizehint!(Int[],length(cones))          #Starting index of each large second-order cone 
-    num_socs = sizehint!(Int[],length(cones))
-    last_sizes = sizehint!(Int[],length(cones))      #Size of the last expanded second-order cones 
+        Atnew.conservativeResize(Atnew.rows(), Atnew.cols() + Ati.cols());
+        Atnew.middleCols(Atnew.cols() - Ati.cols(), Ati.cols()) = Ati;
+        bnew.insert(bnew.end(), bi.begin(), bi.end());
+        conesnew.insert(conesnew.end(), conesi.begin(), conesi.end());
 
-    cones_dim = 0
-    for (i,cone) in enumerate(cones)
-        numel_cone = Clarabel.nvars(cone)
-        if isa(cone,Clarabel.SecondOrderConeT) && numel_cone > size_soc
-            append!(soc_indices, i)
-            append!(soc_starts, cones_dim)
+        start_idx = end_idx;
+        cone_idx = ind;
+    }
 
-            num_soc, last_size = count_soc(cone,size_soc)
-            append!(num_socs, num_soc)
-            append!(last_sizes, last_size)
-            n_large_soc += 1
-        end
+    if (cone_idx < cones.size()) {
+        std::vector<int> rng(start_idx + 1, A.cols());
+        Atnew.conservativeResize(Atnew.rows(), Atnew.cols() + rng.size());
+        Atnew.middleCols(Atnew.cols() - rng.size(), rng.size()) = At.middleCols(rng[0], rng.size());
+        bnew.insert(bnew.end(), b.begin() + rng[0], b.end());
+        conesnew.insert(conesnew.end(), cones.begin() + cone_idx, cones.end());
+    }
 
-        cones_dim += numel_cone
-    end
+    SparseMatrix<T> Pnew(n + extra_dim, n + extra_dim);
+    Pnew.topLeftCorner(n, n) = P;
+    Pnew.bottomRightCorner(extra_dim, extra_dim).setZero();
+    Pnew.topRightCorner(n, extra_dim).setZero();
+    Pnew.bottomLeftCorner(extra_dim, n).setZero();
 
-    resize!(num_socs,n_large_soc)
-    resize!(last_sizes,n_large_soc)
+    P = Pnew;
+    q.resize(n + extra_dim, 0);
+    A = Atnew.transpose();
+    b = bnew;
+    cones = conesnew;
+}
 
-    return num_socs, last_sizes, soc_indices, soc_starts
-end
+void expand_soc(std::vector<SupportedCone>& cones, int size_soc, std::vector<int>& num_socs, std::vector<int>& last_sizes, std::vector<int>& soc_indices, std::vector<int>& soc_starts) {
+    int n_large_soc = 0;
+    soc_indices.reserve(cones.size());
+    soc_starts.reserve(cones.size());
+    num_socs.reserve(cones.size());
+    last_sizes.reserve(cones.size());
+
+    int cones_dim = 0;
+    for (size_t i = 0; i < cones.size(); ++i) {
+        int numel_cone = Clarabel::nvars(cones[i]);
+        if (typeid(cones[i]) == typeid(Clarabel::SecondOrderConeT) && numel_cone > size_soc) {
+            soc_indices.push_back(i);
+            soc_starts.push_back(cones_dim);
+
+            int num_soc, last_size;
+            std::tie(num_soc, last_size) = count_soc(cones[i], size_soc);
+            num_socs.push_back(num_soc);
+            last_sizes.push_back(last_size);
+            n_large_soc += 1;
+        }
+
+        cones_dim += numel_cone;
+    }
+
+    num_socs.resize(n_large_soc);
+    last_sizes.resize(n_large_soc);
+}

@@ -1,75 +1,90 @@
-using Test, LinearAlgebra, SparseArrays, Random
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <cassert>
+#include <cuda_runtime.h>
+#include <cusparse.h>
+#include <cublas_v2.h>
+#include <cusolverDn.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/copy.h>
+#include <thrust/fill.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/for_each.h>
+#include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/inner_product.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/transform_scan.h>
+#include <thrust/sequence.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/zip_function.h>
+#include <random>
 
-#if not run in full test setup, just do it for one float type
-@isdefined(UnitTestFloats) || (UnitTestFloats = [Float64])
+template <typename T>
+std::tuple<thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, std::vector<SupportedCone>> basic_SOCP_data() {
+    std::mt19937 rng(242713);
+    int n = 3;
+    thrust::host_vector<T> P_host(n * n);
+    std::generate(P_host.begin(), P_host.end(), [&]() { return static_cast<T>(rng() / static_cast<T>(rng.max())); });
+    thrust::device_vector<T> P = P_host;
+    thrust::device_vector<T> A(n * n, static_cast<T>(1));
+    thrust::device_vector<T> A1 = A;
+    thrust::transform(A1.begin(), A1.end(), A1.begin(), [](T val) { return val * 2; });
+    thrust::device_vector<T> c = {static_cast<T>(0.1), static_cast<T>(-2.0), static_cast<T>(1.0)};
+    thrust::device_vector<T> b1(6, static_cast<T>(1));
+    std::vector<SupportedCone> cones = {NonnegativeConeT(3), NonnegativeConeT(3)};
 
-function basic_SOCP_data(Type::Type{T}) where {T <: AbstractFloat}
+    thrust::device_vector<T> A2(n * n, static_cast<T>(1));
+    thrust::device_vector<T> b2 = {static_cast<T>(0), static_cast<T>(0), static_cast<T>(0)};
+    thrust::device_vector<T> A_combined(A1.size() + A2.size());
+    thrust::copy(A1.begin(), A1.end(), A_combined.begin());
+    thrust::copy(A2.begin(), A2.end(), A_combined.begin() + A1.size());
+    thrust::device_vector<T> b_combined(b1.size() + b2.size());
+    thrust::copy(b1.begin(), b1.end(), b_combined.begin());
+    thrust::copy(b2.begin(), b2.end(), b_combined.begin() + b1.size());
+    cones.push_back(SecondOrderConeT(3));
 
-    rng = Random.MersenneTwister(242713)
-    n = 3
-    P = randn(rng,n,n)*1
-    P = SparseMatrixCSC{T}(convert(Matrix{T},(P'*P)))
-    A = SparseMatrixCSC{T}(I(n)*one(T))
-    A1 = [A;-A]*2
-    c = T[0.1;-2.;1.]
-    b1 = ones(T,6)
-    cones = Clarabel.SupportedCone[Clarabel.NonnegativeConeT(3), Clarabel.NonnegativeConeT(3)]
+    return std::make_tuple(P, c, A_combined, b_combined, cones);
+}
 
+template <typename T>
+void test_basic_SOCP() {
+    T tol = static_cast<T>(1e-3);
 
-    #add a SOC constraint
-    A2 = SparseMatrixCSC{T}(I(n)*one(T))
-    b2 = [0;0;0]
-    A = [A1; A2]
-    b = [b1; b2]
-    push!(cones,Clarabel.SecondOrderConeT(3))
+    auto [P, c, A, b, cones] = basic_SOCP_data<T>();
+    Solver<T> solver;
+    solver.setup(P, c, A, b, cones);
+    auto solution = solver.solve();
 
-    return (P,c,A,b,cones)
-end
+    assert(solution.status == SOLVED);
+    assert(std::abs(thrust::reduce(solution.x.begin(), solution.x.end(), static_cast<T>(0), thrust::plus<T>()) - static_cast<T>(-0.5 + 0.435603 - 0.245459)) < tol);
+    assert(std::abs(solution.obj_val - static_cast<T>(-8.4590e-01)) < tol);
+    assert(std::abs(solution.obj_val_dual - static_cast<T>(-8.4590e-01)) < tol);
 
+    b[7] = static_cast<T>(-10);
+    solver.setup(P, c, A, b, cones);
+    solution = solver.solve();
 
-@testset "Basic SOCP Tests" begin
+    assert(solution.status == PRIMAL_INFEASIBLE);
+    assert(std::isnan(solution.obj_val));
+    assert(std::isnan(solution.obj_val_dual));
+}
 
-    for FloatT in UnitTestFloats
-
-        tol = FloatT(1e-3)
-
-        @testset "Basic SOCP Tests (T = $(FloatT))" begin
-
-            @testset "feasible" begin
-
-                P,c,A,b,cones = basic_SOCP_data(FloatT)
-                solver   = Clarabel.Solver(P,c,A,b,cones)
-                Clarabel.solve!(solver)
-
-                @test solver.solution.status == Clarabel.SOLVED
-                @test isapprox(
-                norm(solver.solution.x -
-                FloatT[ -0.5 ; 0.435603 ;  -0.245459]),
-                zero(FloatT), atol=tol)
-                @test isapprox(solver.solution.obj_val, FloatT(-8.4590e-01), atol=tol)
-                @test isapprox(solver.solution.obj_val_dual, FloatT(-8.4590e-01), atol=tol)
-
-
-            end
-
-            @testset "infeasible" begin
-
-                P,c,A,b,cones = basic_SOCP_data(FloatT)
-                b[7] = -10.;
-
-                solver   = Clarabel.Solver(P,c,A,b,cones)
-                Clarabel.solve!(solver)
-
-                @test solver.solution.status == Clarabel.PRIMAL_INFEASIBLE
-                @test isnan(solver.solution.obj_val)
-                @test isnan(solver.solution.obj_val_dual)
-
-            end
-
-        end      #end "Basic SOCP Tests (FloatT)"
-
-    end # UnitTestFloats
-
-end #"Basic SOCP Tests"
-
-nothing
+int main() {
+    test_basic_SOCP<float>();
+    test_basic_SOCP<double>();
+    return 0;
+}

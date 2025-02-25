@@ -1,173 +1,199 @@
-using CUDA, CUDA.CUSPARSE
+#include <vector>
+#include <unordered_map>
+#include <cuda_runtime.h>
+#include <cusparse.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <numeric>
+#include <algorithm>
+#include <stdexcept>
+#include <typeindex>
 
-# -------------------------------------
-# collection of cones for composite
-# operations on a compound set, including
-# conewise scaling operations
-# -------------------------------------
+template <typename T>
+class CompositeConeGPU {
+public:
+    // Redundant CPU data, need to be removed later
+    std::vector<AbstractCone<T>*> cones;
 
-struct CompositeConeGPU{T} <: AbstractCone{T}
-    #YC: redundant CPU data, need to be removed later
-    cones::AbstractVector{AbstractCone{T}}  
+    // Count of each cone type
+    std::unordered_map<std::type_index, int> type_counts;
 
-    #count of each cone type
-    type_counts::Dict{Type,Cint}
+    // Overall size of the composite cone
+    int numel;
+    int degree;
 
-    #overall size of the composite cone
-    numel::Cint
-    degree::Cint
+    // Range views
+    std::vector<std::pair<int, int>> rng_cones;
+    std::vector<std::pair<int, int>> rng_blocks;
 
-    #range views
-    rng_cones::AbstractVector{UnitRange{Cint}}
-    rng_blocks::AbstractVector{UnitRange{Cint}}
+    // The flag for symmetric cone check
+    bool _is_symmetric;
+    int n_linear;
+    int n_nn;
+    int n_soc;
+    int n_exp;
+    int n_pow;
+    int n_psd;
 
-    # the flag for symmetric cone check
-    _is_symmetric::Bool
-    n_linear::Cint
-    n_nn::Cint
-    n_soc::Cint
-    n_exp::Cint
-    n_pow::Cint
-    n_psd::Cint
+    std::vector<int> idx_eq;
+    std::vector<int> idx_inq;
 
-    idx_eq::Vector{Cint}
-    idx_inq::Vector{Cint}
+    // Data
+    thrust::device_vector<T> w;
+    thrust::device_vector<T> λ;
+    thrust::device_vector<T> η;
 
-    #data
-    w::AbstractVector{T}
-    λ::AbstractVector{T}
-    η::AbstractVector{T}
+    // Nonsymmetric cone
+    thrust::device_vector<T> αp;           // Power parameters of power cones
+    thrust::device_vector<T> H_dual;        // Hessian of the dual barrier at z 
+    thrust::device_vector<T> Hs;            // Scaling matrix
+    thrust::device_vector<T> grad;         // Gradient of the dual barrier at z 
 
-    #nonsymmetric cone
-    αp::AbstractVector{T}           #power parameters of power cones
-    H_dual::AbstractArray{T}        #Hessian of the dual barrier at z 
-    Hs::AbstractArray{T}            #scaling matrix
-    grad::AbstractArray{T}         #gradient of the dual barrier at z 
+    // PSD cone
+    int psd_dim;                  // We only support PSD cones with the same small dimension
+    thrust::device_vector<T> chol1;
+    thrust::device_vector<T> chol2;
+    thrust::device_vector<T> SVD;
+    thrust::device_vector<T> λpsd;
+    thrust::device_vector<T> Λisqrt;
+    thrust::device_vector<T> R;
+    thrust::device_vector<T> Rinv;
+    thrust::device_vector<T> Hspsd;
 
-    #PSD cone
-    psd_dim::Cint                  #We only support PSD cones with the same small dimension
-    chol1::AbstractArray{T,3}
-    chol2::AbstractArray{T,3}
-    SVD::AbstractArray{T,3}
-    λpsd::AbstractMatrix{T}
-    Λisqrt::AbstractMatrix{T}
-    R::AbstractArray{T,3}
-    Rinv::AbstractArray{T,3}
-    Hspsd::AbstractArray{T,3}
+    // Workspace for various internal uses
+    thrust::device_vector<T> workmat1;
+    thrust::device_vector<T> workmat2;
+    thrust::device_vector<T> workmat3;
+    thrust::device_vector<T> workvec;
 
-    #workspace for various internal uses
-    workmat1::AbstractArray{T,3}
-    workmat2::AbstractArray{T,3}
-    workmat3::AbstractArray{T,3}
-    workvec::AbstractVector{T}
+    // Step size
+    thrust::device_vector<T> α;
 
-    #step_size
-    α::AbstractVector{T}
+    CompositeConeGPU(CompositeCone<T>& cpucones) {
+        // Information from the CompositeCone on CPU 
+        cones = cpucones.cones;
+        type_counts = cpucones.type_counts;
+        _is_symmetric = cpucones._is_symmetric;
 
-    function CompositeConeGPU{T}(cpucones::CompositeCone{T}) where {T}
+        n_zero = type_counts.count(typeid(ZeroCone)) ? type_counts[typeid(ZeroCone)] : 0;
+        n_nn = type_counts.count(typeid(NonnegativeCone)) ? type_counts[typeid(NonnegativeCone)] : 0;
+        n_linear = n_zero + n_nn;
+        n_soc = type_counts.count(typeid(SecondOrderCone)) ? type_counts[typeid(SecondOrderCone)] : 0;
+        n_exp = type_counts.count(typeid(ExponentialCone)) ? type_counts[typeid(ExponentialCone)] : 0;
+        n_pow = type_counts.count(typeid(PowerCone)) ? type_counts[typeid(PowerCone)] : 0;
+        n_psd = type_counts.count(typeid(PSDTriangleCone)) ? type_counts[typeid(PSDTriangleCone)] : 0;
 
-        #Information from the CompositeCone on CPU 
-        cones  = cpucones.cones
-        type_counts = cpucones.type_counts
-        _is_symmetric = cpucones._is_symmetric
+        // idx set for eq and ineq constraints
+        for (int i = 0; i < n_linear; ++i) {
+            if (typeid(cones[i]) == typeid(ZeroCone<T>)) {
+                idx_eq.push_back(i);
+            } else {
+                idx_inq.push_back(i);
+            }
+        }
 
-        n_zero = haskey(type_counts,ZeroCone) ? type_counts[ZeroCone] : 0
-        n_nn = haskey(type_counts,NonnegativeCone) ? type_counts[NonnegativeCone] : 0
-        n_linear = n_zero + n_nn
-        n_soc = haskey(type_counts,SecondOrderCone) ? type_counts[SecondOrderCone] : 0
-        n_exp = haskey(type_counts,ExponentialCone) ? type_counts[ExponentialCone] : 0
-        n_pow = haskey(type_counts,PowerCone) ? type_counts[PowerCone] : 0
-        n_psd = haskey(type_counts,PSDTriangleCone) ? type_counts[PSDTriangleCone] : 0
+        // Count up elements and degree
+        numel = std::accumulate(cones.begin(), cones.end(), 0, [](int sum, AbstractCone<T>* cone) {
+            return sum + cone->numel();
+        });
+        degree = std::accumulate(cones.begin(), cones.end(), 0, [](int sum, AbstractCone<T>* cone) {
+            return sum + cone->degree();
+        });
 
-        #idx set for eq and ineq constraints
-        idx_eq = Vector{Cint}([])
-        idx_inq = Vector{Cint}([])
-        for i in 1:n_linear
-            typeof(cones[i]) === ZeroCone{T} ? push!(idx_eq,i) : push!(idx_inq,i) 
-        end
+        int numel_linear = std::accumulate(cones.begin(), cones.begin() + n_linear, 0, [](int sum, AbstractCone<T>* cone) {
+            return sum + cone->numel();
+        });
+        int max_linear = std::max_element(cones.begin(), cones.begin() + n_linear, [](AbstractCone<T>* a, AbstractCone<T>* b) {
+            return a->numel() < b->numel();
+        })->numel();
+        int numel_soc = std::accumulate(cones.begin() + n_linear, cones.begin() + n_linear + n_soc, 0, [](int sum, AbstractCone<T>* cone) {
+            return sum + cone->numel();
+        });
 
-        #count up elements and degree
-        numel  = sum(cone -> Clarabel.numel(cone), cones; init = 0)
-        degree = sum(cone -> Clarabel.degree(cone), cones; init = 0)
+        w.resize(numel_linear + numel_soc);
+        λ.resize(numel_linear + numel_soc);
+        η.resize(n_soc);
 
-        @views numel_linear  = sum(cone -> Clarabel.numel(cone), cones[1:n_linear]; init = 0)
-        @views max_linear = maximum(cone -> Clarabel.numel(cone), cones[1:n_linear]; init = 0)
-        @views numel_soc  = sum(cone -> Clarabel.numel(cone), cones[n_linear+1:n_linear+n_soc]; init = 0)
+        // Initialize space for nonsymmetric cones
+        αp.resize(n_pow);
+        int pow_ind = n_linear + n_soc + n_exp;
+        // Store the power parameter of each power cone
+        for (int i = 0; i < n_pow; ++i) {
+            αp[i] = cones[i + pow_ind]->α;
+        }
 
-        w = CuVector{T}(undef,numel_linear+numel_soc)
-        λ = CuVector{T}(undef,numel_linear+numel_soc)
-        η = CuVector{T}(undef,n_soc)
+        H_dual.resize((n_exp + n_pow) * 3 * 3);
+        Hs.resize((n_exp + n_pow) * 3 * 3);
+        grad.resize((n_exp + n_pow) * 3);
 
-        #Initialize space for nonsymmetric cones
-        αp = Vector{T}(undef,n_pow)
-        pow_ind = n_linear + n_soc + n_exp
-        #store the power parameter of each power cone
-        for i in 1:n_pow
-            αp[i] = cones[i+pow_ind].α
-        end
+        // PSD cone
+        // We require all psd cones have the same dimensionality
+        int psd_ind = pow_ind + n_pow;
+        psd_dim = type_counts.count(typeid(PSDTriangleCone)) ? cones[psd_ind]->n : 0;
+        for (int i = 0; i < n_psd; ++i) {
+            if (psd_dim != cones[psd_ind + i]->n) {
+                throw std::runtime_error("Not all positive definite cones have the same dimensionality!");
+            }
+        }
 
-        αp = CuVector(αp)
-        H_dual = CuArray{T}(undef,n_exp+n_pow,3,3)
-        Hs = CuArray{T}(undef,n_exp+n_pow,3,3)
-        grad = CuArray{T}(undef,n_exp+n_pow,3)
+        chol1.resize(psd_dim * psd_dim * n_psd);
+        chol2.resize(psd_dim * psd_dim * n_psd);
+        SVD.resize(psd_dim * psd_dim * n_psd);
 
-        #PSD cone
-        #We require all psd cones have the same dimensionality
-        psd_ind = pow_ind + n_pow
-        psd_dim = haskey(type_counts,PSDTriangleCone) ? cones[psd_ind+1].n : 0
-        for i in 1:n_psd
-            if(psd_dim != cones[psd_ind+i].n)
-                throw(DimensionMismatch("Not all positive definite cones have the same dimensionality!"))
-            end
-        end
+        λpsd.resize(psd_dim * n_psd);
+        Λisqrt.resize(psd_dim * n_psd);
+        R.resize(psd_dim * psd_dim * n_psd);
+        Rinv.resize(psd_dim * psd_dim * n_psd);
+        Hspsd.resize(triangular_number(psd_dim) * triangular_number(psd_dim) * n_psd);
 
-        chol1 = CUDA.zeros(T,psd_dim,psd_dim,n_psd)
-        chol2 = CUDA.zeros(T,psd_dim,psd_dim,n_psd)
-        SVD   = CUDA.zeros(T,psd_dim,psd_dim,n_psd)
+        workmat1.resize(psd_dim * psd_dim * n_psd);
+        workmat2.resize(psd_dim * psd_dim * n_psd);
+        workmat3.resize(psd_dim * psd_dim * n_psd);
+        workvec.resize(triangular_number(psd_dim) * n_psd);
 
-        λpsd   = CUDA.zeros(T,psd_dim,n_psd)
-        Λisqrt = CUDA.zeros(T,psd_dim,n_psd)
-        R      = CUDA.zeros(T,psd_dim,psd_dim,n_psd)
-        Rinv   = CUDA.zeros(T,psd_dim,psd_dim,n_psd)
-        Hspsd  = CUDA.zeros(T,triangular_number(psd_dim),triangular_number(psd_dim),n_psd)
+        α.resize(std::accumulate(cones.begin(), cones.end(), 0, [](int sum, AbstractCone<T>* cone) {
+            return sum + cone->numel();
+        })); // Workspace for step size calculation and neighborhood check
 
-        workmat1 = CUDA.zeros(T,psd_dim,psd_dim,n_psd)
-        workmat2 = CUDA.zeros(T,psd_dim,psd_dim,n_psd)
-        workmat3 = CUDA.zeros(T,psd_dim,psd_dim,n_psd)
-        workvec  = CUDA.zeros(T,triangular_number(psd_dim)*n_psd)
+        rng_cones = cpucones.rng_cones;
+        rng_blocks = cpucones.rng_blocks;
+    }
 
-        α = CuVector{T}(undef,sum(cone -> Clarabel.numel(cone), cones; init = 0)) #workspace for step size calculation and neighborhood check
+    AbstractCone<T>* operator[](int i) const {
+        return cones[i];
+    }
 
-        return new(cones,type_counts,numel,degree,CuVector(cpucones.rng_cones),CuVector(cpucones.rng_blocks),_is_symmetric,
-                n_linear, n_nn, n_soc, n_exp, n_pow, n_psd,
-                idx_eq,idx_inq,
-                w,λ,η,
-                αp,H_dual,Hs,grad,
-                psd_dim,chol1,chol2,SVD,λpsd,Λisqrt,R,Rinv,Hspsd,workmat1,workmat2,workmat3,workvec,
-                α)
-    end
-end
+    std::vector<AbstractCone<T>*> operator[](const std::vector<bool>& b) const {
+        std::vector<AbstractCone<T>*> result;
+        for (size_t i = 0; i < cones.size(); ++i) {
+            if (b[i]) {
+                result.push_back(cones[i]);
+            }
+        }
+        return result;
+    }
 
-CompositeConeGPU(args...) = CompositeConeGPU{DefaultFloat}(args...)
+    auto begin() const {
+        return cones.begin();
+    }
 
+    auto end() const {
+        return cones.end();
+    }
 
-# partial implementation of AbstractArray behaviours
-function Base.getindex(S::CompositeConeGPU{T}, i::Int) where {T}
-    @boundscheck checkbounds(S.cones,i)
-    @inbounds S.cones[i]
-end
+    size_t size() const {
+        return cones.size();
+    }
 
-Base.getindex(S::CompositeConeGPU{T}, b::BitVector) where {T} = S.cones[b]
-Base.iterate(S::CompositeConeGPU{T}) where{T} = iterate(S.cones)
-Base.iterate(S::CompositeConeGPU{T}, state) where{T} = iterate(S.cones, state)
-Base.length(S::CompositeConeGPU{T}) where{T} = length(S.cones)
-Base.eachindex(S::CompositeConeGPU{T}) where{T} = eachindex(S.cones)
-Base.IndexStyle(S::CompositeConeGPU{T}) where{T} = IndexStyle(S.cones)
+    auto eachindex() const {
+        return cones.eachindex();
+    }
 
-function get_type_count(cones::CompositeConeGPU{T}, type::Type) where {T}
-    if haskey(cones.type_counts,type)
-        return cones.type_counts[type]
-    else
-        return Cint(0)
-    end
-end
+    static int get_type_count(const CompositeConeGPU<T>& cones, const std::type_index& type) {
+        if (cones.type_counts.count(type)) {
+            return cones.type_counts.at(type);
+        } else {
+            return 0;
+        }
+    }
+};
