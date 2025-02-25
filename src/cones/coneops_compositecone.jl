@@ -1,290 +1,306 @@
+#include <vector>
+#include <algorithm>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/for_each.h>
+#include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/inner_product.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/transform_scan.h>
+#include <thrust/sequence.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/zip_function.h>
 
-degree(cones::CompositeCone{T}) where {T} = cones.degree
-numel(cones::CompositeCone{T}) where {T}  = cones.numel
+namespace Clarabel {
 
-# -----------------------------------------------------
-# dispatch operators for multiple cones
-# -----------------------------------------------------
+template <typename T>
+class CompositeCone;
 
-function is_symmetric(cones::CompositeCone{T}) where {T}
-    #true if all pieces are symmetric.  
-    #determined during obj construction
-    return cones._is_symmetric
-end
+template <typename T>
+T degree(const CompositeCone<T>& cones) {
+    return cones.get_degree();
+}
 
-function is_sparse_expandable(cones::CompositeCone{T}) where {T}
-    
-    #This should probably never be called
-    #any(is_sparse_expandable, cones)
-    ErrorException("This function should not be reachable")
-    
-end
+template <typename T>
+T numel(const CompositeCone<T>& cones) {
+    return cones.get_numel();
+}
 
-function allows_primal_dual_scaling(cones::CompositeCone{T}) where {T}
-    all(allows_primal_dual_scaling, cones)
-end
+template <typename T>
+bool is_symmetric(const CompositeCone<T>& cones) {
+    return cones.is_symmetric();
+}
 
+template <typename T>
+bool is_sparse_expandable(const CompositeCone<T>& cones) {
+    throw std::runtime_error("This function should not be reachable");
+}
 
-function rectify_equilibration!(
-    cones::CompositeCone{T},
-     δ::Vector{T},
-     e::Vector{T}
-) where{T}
+template <typename T>
+bool allows_primal_dual_scaling(const CompositeCone<T>& cones) {
+    return std::all_of(cones.get_cones().begin(), cones.get_cones().end(), [](const auto& cone) {
+        return allows_primal_dual_scaling(cone);
+    });
+}
 
-    any_changed = false
+template <typename T>
+bool rectify_equilibration(
+    CompositeCone<T>& cones,
+    thrust::device_vector<T>& δ,
+    thrust::device_vector<T>& e
+) {
+    bool any_changed = false;
 
-    #we will update e <- δ .* e using return values
-    #from this function.  default is to do nothing at all
-    δ .= 1
+    thrust::fill(δ.begin(), δ.end(), static_cast<T>(1));
 
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        δi = view(δ,rng)
-        ei = view(e,rng)
-        @conedispatch any_changed |= rectify_equilibration!(cone,δi,ei)
-    end
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto δi = thrust::make_zip_iterator(thrust::make_tuple(δ.begin() + rng.first, δ.begin() + rng.second));
+        auto ei = thrust::make_zip_iterator(thrust::make_tuple(e.begin() + rng.first, e.begin() + rng.second));
+        any_changed |= rectify_equilibration(cone, δi, ei);
+    }
 
-    return any_changed
-end
+    return any_changed;
+}
 
-function margins(
-    cones::CompositeCone{T},
-    z::Vector{T},
-    pd::PrimalOrDualCone,
-) where {T}
-    α = typemax(T)
-    β = zero(T)
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        @conedispatch (αi,βi) = margins(cone,view(z,rng),pd)
-        α = min(α,αi)
-        β += βi
-    end
+template <typename T>
+std::pair<T, T> margins(
+    const CompositeCone<T>& cones,
+    const thrust::device_vector<T>& z,
+    PrimalOrDualCone pd
+) {
+    T α = std::numeric_limits<T>::max();
+    T β = static_cast<T>(0);
 
-    return (α,β)
-end
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto z_view = thrust::make_zip_iterator(thrust::make_tuple(z.begin() + rng.first, z.begin() + rng.second));
+        auto [αi, βi] = margins(cone, z_view, pd);
+        α = std::min(α, αi);
+        β += βi;
+    }
 
-function scaled_unit_shift!(
-    cones::CompositeCone{T},
-    z::Vector{T},
-    α::T,
-    pd::PrimalOrDualCone
-) where {T}
+    return {α, β};
+}
 
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        @conedispatch scaled_unit_shift!(cone,view(z,rng),α,pd)
-    end
+template <typename T>
+void scaled_unit_shift(
+    CompositeCone<T>& cones,
+    thrust::device_vector<T>& z,
+    T α,
+    PrimalOrDualCone pd
+) {
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto z_view = thrust::make_zip_iterator(thrust::make_tuple(z.begin() + rng.first, z.begin() + rng.second));
+        scaled_unit_shift(cone, z_view, α, pd);
+    }
+}
 
-    return nothing
-end
+template <typename T>
+void unit_initialization(
+    CompositeCone<T>& cones,
+    thrust::device_vector<T>& z,
+    thrust::device_vector<T>& s
+) {
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto z_view = thrust::make_zip_iterator(thrust::make_tuple(z.begin() + rng.first, z.begin() + rng.second));
+        auto s_view = thrust::make_zip_iterator(thrust::make_tuple(s.begin() + rng.first, s.begin() + rng.second));
+        unit_initialization(cone, z_view, s_view);
+    }
+}
 
-# unit initialization for asymmetric solves
-function unit_initialization!(
-    cones::CompositeCone{T},
-    z::Vector{T},
-    s::Vector{T}
-) where {T}
+template <typename T>
+void set_identity_scaling(CompositeCone<T>& cones) {
+    for (const auto& cone : cones.get_cones()) {
+        set_identity_scaling(cone);
+    }
+}
 
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        @conedispatch unit_initialization!(cone,view(z,rng),view(s,rng))
-    end
-    return nothing
-end
+template <typename T>
+bool update_scaling(
+    CompositeCone<T>& cones,
+    thrust::device_vector<T>& s,
+    thrust::device_vector<T>& z,
+    T μ,
+    ScalingStrategy scaling_strategy
+) {
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto s_view = thrust::make_zip_iterator(thrust::make_tuple(s.begin() + rng.first, s.begin() + rng.second));
+        auto z_view = thrust::make_zip_iterator(thrust::make_tuple(z.begin() + rng.first, z.begin() + rng.second));
+        if (!update_scaling(cone, s_view, z_view, μ, scaling_strategy)) {
+            return false;
+        }
+    }
+    return true;
+}
 
-function set_identity_scaling!(
-    cones::CompositeCone{T}
-) where {T}
+template <typename T>
+void get_Hs(
+    CompositeCone<T>& cones,
+    thrust::device_vector<T>& Hsblock,
+    bool is_triangular
+) {
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_blocks())) {
+        auto Hsblock_view = thrust::make_zip_iterator(thrust::make_tuple(Hsblock.begin() + rng.first, Hsblock.begin() + rng.second));
+        get_Hs(cone, Hsblock_view, is_triangular);
+    }
+}
 
-    for cone in cones
-        @conedispatch set_identity_scaling!(cone)
-    end
+template <typename T>
+void mul_Hs(
+    CompositeCone<T>& cones,
+    thrust::device_vector<T>& y,
+    const thrust::device_vector<T>& x,
+    thrust::device_vector<T>& work
+) {
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto y_view = thrust::make_zip_iterator(thrust::make_tuple(y.begin() + rng.first, y.begin() + rng.second));
+        auto x_view = thrust::make_zip_iterator(thrust::make_tuple(x.begin() + rng.first, x.begin() + rng.second));
+        auto work_view = thrust::make_zip_iterator(thrust::make_tuple(work.begin() + rng.first, work.begin() + rng.second));
+        mul_Hs(cone, y_view, x_view, work_view);
+    }
+}
 
-    return nothing
-end
+template <typename T>
+void affine_ds(
+    CompositeCone<T>& cones,
+    thrust::device_vector<T>& ds,
+    const thrust::device_vector<T>& s
+) {
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto ds_view = thrust::make_zip_iterator(thrust::make_tuple(ds.begin() + rng.first, ds.begin() + rng.second));
+        auto s_view = thrust::make_zip_iterator(thrust::make_tuple(s.begin() + rng.first, s.begin() + rng.second));
+        affine_ds(cone, ds_view, s_view);
+    }
+}
 
-function update_scaling!(
-    cones::CompositeCone{T},
-    s::Vector{T},
-    z::Vector{T},
-	μ::T,
-    scaling_strategy::ScalingStrategy
-) where {T}
+template <typename T>
+void combined_ds_shift(
+    CompositeCone<T>& cones,
+    thrust::device_vector<T>& shift,
+    const thrust::device_vector<T>& step_z,
+    const thrust::device_vector<T>& step_s,
+    const thrust::device_vector<T>& z,
+    T σμ
+) {
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto shift_view = thrust::make_zip_iterator(thrust::make_tuple(shift.begin() + rng.first, shift.begin() + rng.second));
+        auto step_z_view = thrust::make_zip_iterator(thrust::make_tuple(step_z.begin() + rng.first, step_z.begin() + rng.second));
+        auto step_s_view = thrust::make_zip_iterator(thrust::make_tuple(step_s.begin() + rng.first, step_s.begin() + rng.second));
+        combined_ds_shift(cone, shift_view, step_z_view, step_s_view, σμ);
+    }
+}
 
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        si = view(s,rng)
-        zi = view(z,rng)
-        @conedispatch is_scaling_success = update_scaling!(cone,si,zi,μ,scaling_strategy)
-        if !is_scaling_success
-            return is_scaling_success = false
-        end
-    end
-    return is_scaling_success = true
-end
+template <typename T>
+void Δs_from_Δz_offset(
+    CompositeCone<T>& cones,
+    thrust::device_vector<T>& out,
+    const thrust::device_vector<T>& ds,
+    thrust::device_vector<T>& work,
+    const thrust::device_vector<T>& z
+) {
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto out_view = thrust::make_zip_iterator(thrust::make_tuple(out.begin() + rng.first, out.begin() + rng.second));
+        auto ds_view = thrust::make_zip_iterator(thrust::make_tuple(ds.begin() + rng.first, ds.begin() + rng.second));
+        auto work_view = thrust::make_zip_iterator(thrust::make_tuple(work.begin() + rng.first, work.begin() + rng.second));
+        auto z_view = thrust::make_zip_iterator(thrust::make_tuple(z.begin() + rng.first, z.begin() + rng.second));
+        Δs_from_Δz_offset(cone, out_view, ds_view, work_view, z_view);
+    }
+}
 
-# The Hs block for each cone.
-function get_Hs!(
-    cones::CompositeCone{T},
-    Hsblock::Vector{T},
-    is_triangular::Bool
-) where {T}
+template <typename T>
+std::pair<T, T> step_length(
+    const CompositeCone<T>& cones,
+    const thrust::device_vector<T>& dz,
+    const thrust::device_vector<T>& ds,
+    const thrust::device_vector<T>& z,
+    const thrust::device_vector<T>& s,
+    const Settings<T>& settings,
+    T αmax
+) {
+    T α = αmax;
 
-    for (cone, rng) in zip(cones,cones.rng_blocks)
-        @conedispatch get_Hs!(cone,view(Hsblock,rng),is_triangular)
-    end
-    return nothing
-end
+    auto innerfcn = [&](T α, bool symcond) {
+        for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+            if (is_symmetric(cone) == symcond) {
+                continue;
+            }
+            auto dz_view = thrust::make_zip_iterator(thrust::make_tuple(dz.begin() + rng.first, dz.begin() + rng.second));
+            auto ds_view = thrust::make_zip_iterator(thrust::make_tuple(ds.begin() + rng.first, ds.begin() + rng.second));
+            auto z_view = thrust::make_zip_iterator(thrust::make_tuple(z.begin() + rng.first, z.begin() + rng.second));
+            auto s_view = thrust::make_zip_iterator(thrust::make_tuple(s.begin() + rng.first, s.begin() + rng.second));
+            auto [nextαz, nextαs] = step_length(cone, dz_view, ds_view, z_view, s_view, settings, α);
+            α = std::min({α, nextαz, nextαs});
+        }
+        return α;
+    };
 
-# compute the generalized product :
-# WᵀWx for symmetric cones 
-# μH(s)x for symmetric cones
+    α = innerfcn(α, false);
 
-function mul_Hs!(
-    cones::CompositeCone{T},
-    y::Vector{T},
-    x::Vector{T},
-    work::Vector{T}
-) where {T}
+    if (!is_symmetric(cones)) {
+        α = std::min(α, settings.max_step_fraction);
+    }
 
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        @conedispatch mul_Hs!(cone,view(y,rng),view(x,rng),view(work,rng))
-    end
+    α = innerfcn(α, true);
 
-    return nothing
-end
+    return {α, α};
+}
 
-# x = λ ∘ λ for symmetric cone and x = s for asymmetric cones
-function affine_ds!(
-    cones::CompositeCone{T},
-    ds::Vector{T},
-    s::Vector{T}
-) where {T}
+template <typename T>
+T compute_barrier(
+    const CompositeCone<T>& cones,
+    const thrust::device_vector<T>& z,
+    const thrust::device_vector<T>& s,
+    const thrust::device_vector<T>& dz,
+    const thrust::device_vector<T>& ds,
+    T α
+) {
+    T barrier = static_cast<T>(0);
 
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        dsi = view(ds,rng)
-        si  = view(s,rng)
-        @conedispatch affine_ds!(cone,dsi,si)
-    end
-    return nothing
-end
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto z_view = thrust::make_zip_iterator(thrust::make_tuple(z.begin() + rng.first, z.begin() + rng.second));
+        auto s_view = thrust::make_zip_iterator(thrust::make_tuple(s.begin() + rng.first, s.begin() + rng.second));
+        auto dz_view = thrust::make_zip_iterator(thrust::make_tuple(dz.begin() + rng.first, dz.begin() + rng.second));
+        auto ds_view = thrust::make_zip_iterator(thrust::make_tuple(ds.begin() + rng.first, ds.begin() + rng.second));
+        barrier += compute_barrier(cone, z_view, s_view, dz_view, ds_view, α);
+    }
 
-function combined_ds_shift!(
-    cones::CompositeCone{T},
-    shift::Vector{T},
-    step_z::Vector{T},
-    step_s::Vector{T},
-    z::Vector{T},
-    σμ::T
-) where {T}
+    return barrier;
+}
 
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        shifti = view(shift,rng)
-        step_zi = view(step_z,rng)
-        step_si = view(step_s,rng)
-        @conedispatch combined_ds_shift!(cone,shifti,step_zi,step_si,σμ)
-    end
+template <typename T>
+bool check_neighborhood(
+    const CompositeCone<T>& cones,
+    const thrust::device_vector<T>& z,
+    const thrust::device_vector<T>& s,
+    const thrust::device_vector<T>& dz,
+    const thrust::device_vector<T>& ds,
+    T α,
+    T μ,
+    T thr
+) {
+    bool centrality = true;
 
-    return nothing
-end
+    for (const auto& [cone, rng] : zip(cones.get_cones(), cones.get_rng_cones())) {
+        auto z_view = thrust::make_zip_iterator(thrust::make_tuple(z.begin() + rng.first, z.begin() + rng.second));
+        auto s_view = thrust::make_zip_iterator(thrust::make_tuple(s.begin() + rng.first, s.begin() + rng.second));
+        auto dz_view = thrust::make_zip_iterator(thrust::make_tuple(dz.begin() + rng.first, dz.begin() + rng.second));
+        auto ds_view = thrust::make_zip_iterator(thrust::make_tuple(ds.begin() + rng.first, ds.begin() + rng.second));
+        centrality = check_neighborhood(cone, z_view, s_view, dz_view, ds_view, α, μ, thr);
+        if (!centrality) {
+            return false;
+        }
+    }
 
-function Δs_from_Δz_offset!(
-    cones::CompositeCone{T},
-    out::Vector{T},
-    ds::Vector{T},
-    work::Vector{T},
-    z::Vector{T}
-) where {T}
+    return true;
+}
 
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        outi  = view(out,rng)
-        dsi   = view(ds,rng)
-        worki = view(work,rng)
-        zi    = view(z,rng)
-        @conedispatch Δs_from_Δz_offset!(cone,outi,dsi,worki,zi) 
-    end
-
-    return nothing
-end
-
-# maximum allowed step length over all cones
-function step_length(
-     cones::CompositeCone{T},
-        dz::Vector{T},
-        ds::Vector{T},
-         z::Vector{T},
-         s::Vector{T},
-  settings::Settings{T},
-      αmax::T,
-) where {T}
-
-    α = αmax
-
-    function innerfcn(α,symcond)
-        for (cone,rng) in zip(cones,cones.rng_cones)
-            if @conedispatch is_symmetric(cone) == symcond
-                continue 
-            end
-            (dzi,dsi) = (view(dz,rng),view(ds,rng))
-            (zi,si)  = (view(z,rng),view(s,rng))
-            @conedispatch (nextαz,nextαs) = step_length(cone,dzi,dsi,zi,si,settings,α)
-            α = min(α,nextαz,nextαs)
-        end
-        return α
-    end
-
-    # Force symmetric cones first.   
-    α = innerfcn(α,false)
-    #if we have any nonsymmetric cones, then back off from full steps slightly
-    #so that centrality checks and logarithms don't fail right at the boundaries
-    if(!is_symmetric(cones))
-        α = min(α,settings.max_step_fraction)
-    end
-
-    # now the nonsymmetric cones
-    α = innerfcn(α,true)
-
-    return (α,α)
-end
-
-# compute the total barrier function at the point (z + α⋅dz, s + α⋅ds)
-function compute_barrier(
-    cones::CompositeCone{T},
-    z::Vector{T},
-    s::Vector{T},
-    dz::Vector{T},
-    ds::Vector{T},
-    α::T
-) where {T}
-    barrier = zero(T)
-
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        zi = view(z,rng)
-        si = view(s,rng)
-        dzi = view(dz,rng)
-        dsi = view(ds,rng)
-        @conedispatch barrier += compute_barrier(cone,zi,si,dzi,dsi,α)
-    end
-
-    return barrier
-end
-
-function check_neighborhood(
-    cones::CompositeCone{T},
-    z::AbstractVector{T},
-    s::AbstractVector{T},  
-    dz::AbstractVector{T},
-    ds::AbstractVector{T},
-    α::T,
-    μ::T,
-    thr::T
-) where {T}
-
-    centrality = true
-    for (cone,rng) in zip(cones,cones.rng_cones)
-        zi = view(z,rng)
-        si = view(s,rng)
-        dzi = view(dz,rng)
-        dsi = view(ds,rng)
-        @conedispatch  centrality = check_neighborhood(cone,zi,si,dzi,dsi,α,μ,thr)
-        centrality ? continue : return false
-    end
-
-    return true
-end
+} // namespace Clarabel

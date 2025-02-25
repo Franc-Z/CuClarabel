@@ -1,381 +1,183 @@
-using TimerOutputs
-
-# -------------------------------------
-# default solver component  types 
-# -------------------------------------
-
-# ---------------------
-# presolver and internals 
-# ---------------------
-
-struct PresolverRowReductionIndex 
-
-    # vector of length = original RHS.   Entries are false
-    # for those rows that should be eliminated before solve
-    keep_logical::Vector{Bool}
-
-end
-struct Presolver{T}
-
-   # original cones of the problem
-    init_cones::Vector{SupportedCone}
-
-    # record of reduced constraints for NN cones with inf bounds
-    reduce_map::Option{PresolverRowReductionIndex}
-
-    # size of original and reduced RHS, respectively 
-    mfull::DefaultInt 
-    mreduced::DefaultInt
-
-    # inf bound that was taken from the module level 
-    # and should be applied throughout.   Held here so 
-    # that any subsequent change to the module's state 
-    # won't mess up our solver mid-solve 
-    infbound::DefaultFloat 
-
-end
-
-Presolver(args...) = Presolver{DefaultFloat}(args...)
-
-# ---------------
-# variables
-# ---------------
-
-mutable struct DefaultVariables{T} <: AbstractVariables{T}
-
-    x::AbstractVector{T}
-    s::AbstractVector{T}
-    z::AbstractVector{T}
-    τ::T
-    κ::T
-
-    function DefaultVariables{T}(
-        n::DefaultInt, 
-        m::DefaultInt,
-        use_gpu::Bool
-    ) where {T}
-
-        x = use_gpu ? CuVector{T}(undef,n) : Vector{T}(undef,n)
-        s = use_gpu ? CuVector{T}(undef,m) : Vector{T}(undef,m)
-        z = use_gpu ? CuVector{T}(undef,m) : Vector{T}(undef,m)
-        τ = T(1)
-        κ = T(1)
-
-        new(x,s,z,τ,κ)
-    end
-
-end
-
-DefaultVariables(args...) = DefaultVariables{DefaultFloat}(args...)
-
-# Scaling strategy for variables.  Defined
-# here to avoid errors due to order of includes
-
-@enum ScalingStrategy begin
-    PrimalDual = 0
-    Dual       = 1
-end
-
-
-# ---------------
-# residuals
-# ---------------
-
-mutable struct DefaultResiduals{T} <: AbstractResiduals{T}
-
-    #the main KKT residuals
-    rx::AbstractVector{T}
-    rz::AbstractVector{T}
-    rτ::T
-
-    #partial residuals for infeasibility checks
-    rx_inf::AbstractVector{T}
-    rz_inf::AbstractVector{T}
-
-    #various inner products.
-    #NB: these are invariant w.r.t equilibration
-    dot_qx::T
-    dot_bz::T
-    dot_sz::T
-    dot_xPx::T
-
-    #the product Px by itself. Required for infeasibilty checks
-    Px::AbstractVector{T}
-
-    function DefaultResiduals{T}(n::DefaultInt,
-                                 m::DefaultInt,
-                                 use_gpu::Bool) where {T}
-
-        VecType = use_gpu ? CuVector : Vector
-        rx = VecType{T}(undef,n)
-        rz = VecType{T}(undef,m)
-        rτ = T(1)
-
-        rx_inf = VecType{T}(undef,n)
-        rz_inf = VecType{T}(undef,m)
-
-        Px = VecType{T}(undef,n)
-
-        new(rx,rz,rτ,rx_inf,rz_inf,zero(T),zero(T),zero(T),zero(T),Px)
-    end
-
-end
-
-DefaultResiduals(args...) = DefaultResiduals{DefaultFloat}(args...)
-
-
-# ---------------
-# equilibration data
-# ---------------
-
-struct DefaultEquilibration{T} <: AbstractEquilibration{T}
-
-    #scaling matrices for problem data equilibration
-    #fields d,e,dinv,einv are vectors of scaling values
-    #to be treated as diagonal scaling data
-    d::Vector{T}
-    dinv::Vector{T}
-    e::Vector{T}
-    einv::Vector{T}
-
-    #overall scaling for objective function
-    c::Base.RefValue{T}
-
-    #GPU data
-    d_gpu::AbstractVector{T}
-    dinv_gpu::AbstractVector{T}
-    e_gpu::AbstractVector{T}
-    einv_gpu::AbstractVector{T}    
-
-    function DefaultEquilibration{T}(
-        n::DefaultInt,
-        m::DefaultInt,
-        use_gpu::Bool
-    ) where {T}
-
-        #Left/Right diagonal scaling for problem data
-        d    = ones(T,n)
-        dinv = ones(T,n)
-        e    = ones(T,m)
-        einv = ones(T,m)
-
-        c    = Ref(T(1.))
-
-        if use_gpu
-            d_gpu = n > 0 ? unsafe_wrap(CuArray{T,1},d) : CUDA.zeros(T,0)
-            dinv_gpu = n > 0 ? unsafe_wrap(CuArray{T,1},dinv) : CUDA.zeros(T,0)
-            e_gpu = m > 0 ? unsafe_wrap(CuArray{T,1},e) : CUDA.zeros(T,0)
-            einv_gpu = m > 0 ? unsafe_wrap(CuArray{T,1},einv) : CUDA.zeros(T,0)
-        else
-            d_gpu = Vector{Float64}()
-            dinv_gpu = Vector{Float64}()
-            e_gpu = Vector{Float64}()
-            einv_gpu = Vector{Float64}()
-        end
-
-        new(d,dinv,e,einv,c,d_gpu,dinv_gpu,e_gpu,einv_gpu)
-    end
-
-end
-
-DefaultEquilibration(args...) = DefaultEquilibration{DefaultFloat}(args...)
-
-
-# ---------------
-# problem data
-# ---------------
-
-mutable struct DefaultProblemData{T} <: AbstractProblemData{T}
-
-    P::AbstractMatrix{T}
-    q::Vector{T}
-    A::AbstractMatrix{T}
-    b::Vector{T}
-    cones::Vector{SupportedCone}
-    n::DefaultInt
-    m::DefaultInt
-    equilibration::DefaultEquilibration{T}
-
-    # unscaled inf norms of linear terms.  Set to "nothing"
-    # during data updating to allow for multiple updates, and 
-    # then recalculated during solve if needed
-
-    normq::Option{T}  #unscaled inf norm of q
-    normb::Option{T}  #unscaled inf norm of b
-
-    presolver::Option{Presolver{T}}
-    chordal_info::Option{ChordalInfo{T}}
-
-    #YC: temporary GPU data
-    P_gpu::Union{AbstractMatrix{T},Nothing}
-    q_gpu::Union{AbstractVector{T},Nothing}
-    A_gpu::Union{AbstractMatrix{T},Nothing}
-    At_gpu::Union{AbstractMatrix{T},Nothing}
-    b_gpu::Union{AbstractVector{T},Nothing}
-
-end
-
-DefaultProblemData(args...) = DefaultProblemData{DefaultFloat}(args...)
-
-
-# ----------------------
-# progress info
-# ----------------------
-
-mutable struct DefaultInfo{T} <: AbstractInfo{T}
-
-    μ::T
-    sigma::T
-    step_length::T
-    iterations::UInt32
-    cost_primal::T
-    cost_dual::T
-    res_primal::T
-    res_dual::T
-    res_primal_inf::T
-    res_dual_inf::T
-    gap_abs::T
-    gap_rel::T
-    ktratio::T
-
-    # previous iterate
-    prev_cost_primal::T
-    prev_cost_dual::T
-    prev_res_primal::T
-    prev_res_dual::T
-    prev_gap_abs::T
-    prev_gap_rel::T
-
-    solve_time::Float64
-    status::SolverStatus
-
-    function DefaultInfo{T}() where {T}
-
-        #here we set the first set of fields to zero (it doesn't matter),
-        #but the previous iterates to Inf to avoid weird edge cases 
-        prevvals = ntuple(x->floatmax(T), 6);
-        new((ntuple(x->0, fieldcount(DefaultInfo)-6-1)...,prevvals...,UNSOLVED)...)
-    end
-
-end
-
-DefaultInfo(args...) = DefaultInfo{DefaultFloat}(args...)
-
-
-# ---------------
-# solver results
-# ---------------
-
-"""
-    DefaultSolution{T <: AbstractFloat}
-Object returned by the Clarabel solver after calling `optimize!(model)`.
-
-Fieldname | Description
----  | :--- | :---
-x | Vector{T}| Primal variable
-z | Vector{T}| Dual variable
-s | Vector{T}| (Primal) set variable
-status | Symbol | Solution status
-obj_val | T | Objective value (primal)
-obj_val_dual | T | Objective value (dual)
-solve_time | T | Solver run time
-iterations | Int | Number of solver iterations
-r_prim       | primal residual at termination
-r_dual       | dual residual at termination
-
-If the status field indicates that the problem is solved then (x,z,s) are the calculated solution, or a best guess if the solver has terminated early due to time or iterations limits.
-
-If the status indicates either primal or dual infeasibility, then (x,z,s) provide instead an infeasibility certificate.
-"""
-mutable struct DefaultSolution{T} <: AbstractSolution{T}
-    x::AbstractVector{T}
-    z::AbstractVector{T}
-    s::AbstractVector{T}
-    status::SolverStatus
-    obj_val::T
-    obj_val_dual::T
-    solve_time::T
-    iterations::UInt32
-    r_prim::T
-    r_dual::T
-
-end
-
-function DefaultSolution{T}(n,m,use_gpu::Bool) where {T <: AbstractFloat}
-
-    VecType = use_gpu ? CuVector : Vector
-    x = VecType{T}(undef,n)
-    z = VecType{T}(undef,m)
-    s = VecType{T}(undef,m)
-
-    # seemingly reasonable defaults
-    status  = UNSOLVED
-    obj_val = T(NaN)
-    obj_val_dual = T(NaN)
-    solve_time = zero(T)
-    iterations = 0
-    r_prim     = T(NaN)
-    r_dual     = T(NaN)
-
-  return DefaultSolution{T}(x,z,s,status,obj_val,obj_val_dual,solve_time,iterations,r_prim,r_dual)
-end
-
-DefaultSolution(args...) = DefaultSolution{DefaultFloat}(args...)
-
-
-# -------------------------------------
-# top level solver type
-# -------------------------------------
-
-"""
-	Solver{T <: AbstractFloat}()
-Initializes an empty Clarabel solver that can be filled with problem data using:
-
-    setup!(solver, P, q, A, b, cones, [settings]).
-
-"""
-mutable struct Solver{T <: AbstractFloat} <: AbstractSolver{T}
-
-    data::Option{AbstractProblemData{T}}
-    variables::Option{AbstractVariables{T}}
-    cones::Union{CompositeCone{T},CompositeConeGPU{T},Nothing}
-    residuals::Option{AbstractResiduals{T}}
-    kktsystem::Option{AbstractKKTSystem{T}}
-    info::Option{AbstractInfo{T}}
-    step_lhs::Option{AbstractVariables{T}}
-    step_rhs::Option{AbstractVariables{T}}
-    prev_vars::Option{AbstractVariables{T}}
-    solution::Option{AbstractSolution{T}}
-    use_gpu::Union{Bool,Nothing}
-    settings::Settings{T}
-    timers::TimerOutput
-
-end
-
-#initializes all fields except settings to nothing
-function Solver{T}(settings::Settings{T}) where {T}
-
-    to = TimerOutput()
-    #setup the main timer sections here and
-    #zero them.   This ensures that the sections
-    #exists if we try to clear them later
-    @timeit to "setup!" begin (nothing) end
-    @timeit to "solve!" begin (nothing) end
-    reset_timer!(to["setup!"])
-    reset_timer!(to["solve!"])
-
-    Solver{T}(ntuple(x->nothing, fieldcount(Solver)-2)...,settings,to)
-end
-
-function Solver{T}() where {T}
-    #default settings
-    Solver{T}(Settings{T}())
-end
-
-#partial user defined settings
-function Solver{T}(d::Dict) where {T}
-    Solver{T}(Settings{T}(d))
-end
-
-Solver(args...; kwargs...) = Solver{DefaultFloat}(args...; kwargs...)
-
+#include <vector>
+#include <optional>
+#include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/fill.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/for_each.h>
+#include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/inner_product.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/transform_scan.h>
+#include <thrust/sequence.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/zip_function.h>
+
+namespace Clarabel {
+
+template <typename T>
+class PresolverRowReductionIndex {
+public:
+    std::vector<bool> keep_logical;
+
+    PresolverRowReductionIndex(int size) : keep_logical(size, true) {}
+};
+
+template <typename T>
+class Presolver {
+public:
+    std::vector<SupportedCone> init_cones;
+    std::optional<PresolverRowReductionIndex> reduce_map;
+    int mfull;
+    int mreduced;
+    T infbound;
+
+    Presolver(const std::vector<SupportedCone>& init_cones, int mfull, int mreduced, T infbound)
+        : init_cones(init_cones), mfull(mfull), mreduced(mreduced), infbound(infbound) {}
+};
+
+template <typename T>
+class DefaultVariables {
+public:
+    thrust::device_vector<T> x, s, z;
+    T τ, κ;
+
+    DefaultVariables(int n, int m, bool use_gpu)
+        : x(n), s(m), z(m), τ(1), κ(1) {
+        if (!use_gpu) {
+            x = thrust::host_vector<T>(n);
+            s = thrust::host_vector<T>(m);
+            z = thrust::host_vector<T>(m);
+        }
+    }
+};
+
+enum class ScalingStrategy {
+    PrimalDual = 0,
+    Dual = 1
+};
+
+template <typename T>
+class DefaultResiduals {
+public:
+    thrust::device_vector<T> rx, rz, rx_inf, rz_inf, Px;
+    T rτ, dot_qx, dot_bz, dot_sz, dot_xPx;
+
+    DefaultResiduals(int n, int m, bool use_gpu)
+        : rx(n), rz(m), rx_inf(n), rz_inf(m), Px(n), rτ(1), dot_qx(0), dot_bz(0), dot_sz(0), dot_xPx(0) {
+        if (!use_gpu) {
+            rx = thrust::host_vector<T>(n);
+            rz = thrust::host_vector<T>(m);
+            rx_inf = thrust::host_vector<T>(n);
+            rz_inf = thrust::host_vector<T>(m);
+            Px = thrust::host_vector<T>(n);
+        }
+    }
+};
+
+template <typename T>
+class DefaultEquilibration {
+public:
+    std::vector<T> d, dinv, e, einv;
+    T c;
+    thrust::device_vector<T> d_gpu, dinv_gpu, e_gpu, einv_gpu;
+
+    DefaultEquilibration(int n, int m, bool use_gpu)
+        : d(n, 1), dinv(n, 1), e(m, 1), einv(m, 1), c(1) {
+        if (use_gpu) {
+            d_gpu = thrust::device_vector<T>(d.begin(), d.end());
+            dinv_gpu = thrust::device_vector<T>(dinv.begin(), dinv.end());
+            e_gpu = thrust::device_vector<T>(e.begin(), e.end());
+            einv_gpu = thrust::device_vector<T>(einv.begin(), einv.end());
+        }
+    }
+};
+
+template <typename T>
+class DefaultProblemData {
+public:
+    thrust::device_vector<T> P, q, A, b;
+    std::vector<SupportedCone> cones;
+    int n, m;
+    DefaultEquilibration<T> equilibration;
+    std::optional<T> normq, normb;
+    std::optional<Presolver<T>> presolver;
+    std::optional<ChordalInfo<T>> chordal_info;
+    thrust::device_vector<T> P_gpu, q_gpu, A_gpu, At_gpu, b_gpu;
+
+    DefaultProblemData(const thrust::device_vector<T>& P, const thrust::device_vector<T>& q, const thrust::device_vector<T>& A, const thrust::device_vector<T>& b, const std::vector<SupportedCone>& cones, int n, int m, const DefaultEquilibration<T>& equilibration)
+        : P(P), q(q), A(A), b(b), cones(cones), n(n), m(m), equilibration(equilibration) {}
+};
+
+template <typename T>
+class DefaultInfo {
+public:
+    T μ, sigma, step_length, cost_primal, cost_dual, res_primal, res_dual, res_primal_inf, res_dual_inf, gap_abs, gap_rel, ktratio;
+    T prev_cost_primal, prev_cost_dual, prev_res_primal, prev_res_dual, prev_gap_abs, prev_gap_rel;
+    double solve_time;
+    SolverStatus status;
+    unsigned int iterations;
+
+    DefaultInfo()
+        : μ(0), sigma(0), step_length(0), cost_primal(0), cost_dual(0), res_primal(0), res_dual(0), res_primal_inf(0), res_dual_inf(0), gap_abs(0), gap_rel(0), ktratio(0),
+          prev_cost_primal(std::numeric_limits<T>::max()), prev_cost_dual(std::numeric_limits<T>::max()), prev_res_primal(std::numeric_limits<T>::max()), prev_res_dual(std::numeric_limits<T>::max()), prev_gap_abs(std::numeric_limits<T>::max()), prev_gap_rel(std::numeric_limits<T>::max()),
+          solve_time(0), status(SolverStatus::UNSOLVED), iterations(0) {}
+};
+
+template <typename T>
+class DefaultSolution {
+public:
+    thrust::device_vector<T> x, z, s;
+    SolverStatus status;
+    T obj_val, obj_val_dual, solve_time, r_prim, r_dual;
+    unsigned int iterations;
+
+    DefaultSolution(int n, int m, bool use_gpu)
+        : x(n), z(m), s(m), status(SolverStatus::UNSOLVED), obj_val(std::numeric_limits<T>::quiet_NaN()), obj_val_dual(std::numeric_limits<T>::quiet_NaN()), solve_time(0), r_prim(std::numeric_limits<T>::quiet_NaN()), r_dual(std::numeric_limits<T>::quiet_NaN()), iterations(0) {
+        if (!use_gpu) {
+            x = thrust::host_vector<T>(n);
+            z = thrust::host_vector<T>(m);
+            s = thrust::host_vector<T>(m);
+        }
+    }
+};
+
+template <typename T>
+class Solver {
+public:
+    std::optional<DefaultProblemData<T>> data;
+    std::optional<DefaultVariables<T>> variables;
+    std::variant<CompositeCone<T>, CompositeConeGPU<T>, std::monostate> cones;
+    std::optional<DefaultResiduals<T>> residuals;
+    std::optional<AbstractKKTSystem<T>> kktsystem;
+    std::optional<DefaultInfo<T>> info;
+    std::optional<DefaultVariables<T>> step_lhs, step_rhs, prev_vars;
+    std::optional<DefaultSolution<T>> solution;
+    std::optional<bool> use_gpu;
+    Settings<T> settings;
+    TimerOutput timers;
+
+    Solver(const Settings<T>& settings)
+        : settings(settings), timers(TimerOutput()) {
+        timers.add_section("setup!");
+        timers.add_section("solve!");
+        timers.reset("setup!");
+        timers.reset("solve!");
+    }
+
+    Solver() : Solver(Settings<T>()) {}
+
+    Solver(const std::map<std::string, T>& d) : Solver(Settings<T>(d)) {}
+};
+
+} // namespace Clarabel
