@@ -32,6 +32,8 @@
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/iterator/zip_function.h>
 #include <random>
+#include "Clarabel.hpp"
+#include "coneops_socone_gpu.hpp"
 
 template <typename T>
 std::tuple<thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, thrust::device_vector<T>, std::vector<SupportedCone>> basic_SOCP_data() {
@@ -65,7 +67,7 @@ void test_basic_SOCP() {
     T tol = static_cast<T>(1e-3);
 
     auto [P, c, A, b, cones] = basic_SOCP_data<T>();
-    Solver<T> solver;
+    Clarabel::Solver<T> solver;
     solver.setup(P, c, A, b, cones);
     auto solution = solver.solve();
 
