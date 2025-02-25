@@ -1,172 +1,177 @@
-# -------------------------------------
-# collection of cones for composite
-# operations on a compound set, including
-# conewise scaling operations
-# -------------------------------------
+#include <vector>
+#include <map>
+#include <cassert>
+#include <cuda_runtime.h>
+#include <cusparse.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/fill.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/for_each.h>
+#include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/inner_product.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/transform_scan.h>
+#include <thrust/sequence.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/zip_function.h>
 
-struct CompositeCone{T} <: AbstractCone{T}
+namespace Clarabel {
 
-    cones::Vector{AbstractCone{T}}
+template <typename T>
+class CompositeCone {
+public:
+    CompositeCone(const std::vector<SupportedCone>& cone_specs, bool use_gpu) {
+        cones.reserve(cone_specs.size());
 
-    #count of each cone type
-    type_counts::Dict{Type,DefaultInt}
+        // Assumed symmetric to start
+        _is_symmetric = true;
 
-    #overall size of the composite cone
-    numel::DefaultInt
-    degree::DefaultInt
+        // Create cones with the given dims
+        for (const auto& coneT : cone_specs) {
+            // Make a new cone
+            auto cone = make_cone<T>(coneT);
 
-    #ranges for the indices of the constituent cones
-    rng_cones::Vector{UnitRange{DefaultInt}}
+            // Update global problem symmetry
+            _is_symmetric = _is_symmetric && is_symmetric(cone);
 
-    #ranges for the indices of the constituent Hs blocks
-    #associated with each cone
-    rng_blocks::Vector{UnitRange{DefaultInt}}
+            // Increment type counts
+            auto key = ConeDict.at(typeid(coneT));
+            type_counts[key] += 1;
 
-    # the flag for symmetric cone check
-    _is_symmetric::Bool
+            cones.push_back(cone);
+        }
 
-    function CompositeCone{T}(cone_specs::Vector{SupportedCone},use_gpu::Bool) where {T}
+        // Count up elements and degree
+        numel = std::accumulate(cones.begin(), cones.end(), 0, [](int sum, const auto& cone) {
+            return sum + Clarabel::numel(cone);
+        });
+        degree = std::accumulate(cones.begin(), cones.end(), 0, [](int sum, const auto& cone) {
+            return sum + Clarabel::degree(cone);
+        });
 
-        cones  = sizehint!(AbstractCone{T}[],length(cone_specs))
+        // Ranges for the subvectors associated with each cone,
+        // and the range for the corresponding entries
+        // in the Hs sparse block
+        rng_cones = collect(rng_cones_iterator(cones));
+        rng_blocks = collect(rng_blocks_iterator(cones, use_gpu));
+    }
 
-        type_counts = Dict{Type,DefaultInt}()
+    const auto& get_cones() const {
+        return cones;
+    }
 
-        #assumed symmetric to start
-        _is_symmetric = true
+    int get_numel() const {
+        return numel;
+    }
 
-        #create cones with the given dims
-        for coneT in cone_specs
-            #make a new cone
-            cone = make_cone(T, coneT);
+    int get_degree() const {
+        return degree;
+    }
 
-            #update global problem symmetry
-            _is_symmetric = _is_symmetric && is_symmetric(cone)
+    const auto& get_rng_cones() const {
+        return rng_cones;
+    }
 
-            #increment type counts 
-            key = ConeDict[typeof(coneT)]
-            haskey(type_counts,key) ? type_counts[key] += 1 : type_counts[key] = 1
-            
-            push!(cones,cone)
-        end
+    const auto& get_rng_blocks() const {
+        return rng_blocks;
+    }
 
-        #count up elements and degree
-        numel  = sum(cone -> Clarabel.numel(cone), cones; init = 0)
-        degree = sum(cone -> Clarabel.degree(cone), cones; init = 0)
+    bool is_symmetric() const {
+        return _is_symmetric;
+    }
 
-        #ranges for the subvectors associated with each cone,
-        #and the range for the corresponding entries
-        #in the Hs sparse block
+    int get_type_count(const std::type_info& type) const {
+        auto it = type_counts.find(type);
+        if (it != type_counts.end()) {
+            return it->second;
+        }
+        return 0;
+    }
 
-        rng_cones  = collect(rng_cones_iterator(cones));
-        rng_blocks = collect(rng_blocks_iterator(cones,use_gpu));
+private:
+    std::vector<AbstractCone<T>> cones;
+    std::map<std::type_index, int> type_counts;
+    int numel;
+    int degree;
+    std::vector<std::pair<int, int>> rng_cones;
+    std::vector<std::pair<int, int>> rng_blocks;
+    bool _is_symmetric;
+};
 
-        obj = new(cones,type_counts,numel,degree,rng_cones,rng_blocks,_is_symmetric)
-    end
-end
+template <typename T>
+class RangeConesIterator {
+public:
+    RangeConesIterator(const std::vector<AbstractCone<T>>& cones) : cones(cones) {}
 
-CompositeCone(args...) = CompositeCone{DefaultFloat}(args...)
+    auto begin() const {
+        return cones.begin();
+    }
 
+    auto end() const {
+        return cones.end();
+    }
 
-# partial implementation of AbstractArray behaviours
-function Base.getindex(S::CompositeCone{T}, i::DefaultInt) where {T}
-    @boundscheck checkbounds(S.cones,i)
-    @inbounds S.cones[i]
-end
+private:
+    const std::vector<AbstractCone<T>>& cones;
+};
 
-Base.getindex(S::CompositeCone{T}, b::BitVector) where {T} = S.cones[b]
-Base.iterate(S::CompositeCone{T}) where{T} = iterate(S.cones)
-Base.iterate(S::CompositeCone{T}, state) where{T} = iterate(S.cones, state)
-Base.length(S::CompositeCone{T}) where{T} = length(S.cones)
-Base.eachindex(S::CompositeCone{T}) where{T} = eachindex(S.cones)
-Base.IndexStyle(S::CompositeCone{T}) where{T} = IndexStyle(S.cones)
+template <typename T>
+class RangeBlocksIterator {
+public:
+    RangeBlocksIterator(const std::vector<AbstractCone<T>>& cones) : cones(cones) {}
 
-function get_type_count(cones::CompositeCone{T}, type::Type) where {T}
-    if haskey(cones.type_counts,type)
-        return cones.type_counts[type]
-    else
-        return 0
-    end
-end
+    auto begin() const {
+        return cones.begin();
+    }
 
+    auto end() const {
+        return cones.end();
+    }
 
+private:
+    const std::vector<AbstractCone<T>>& cones;
+};
 
-# -------------------------------------
-# iterators to generate indices into vectors 
-# in a cone or cone-related blocks in the Hessian
-struct RangeConesIterator{T}
-    cones::Vector{AbstractCone{T}}
-end
-struct RangeBlocksIterator{T} 
-    cones::Vector{AbstractCone{T}}
-end
+template <typename T>
+RangeConesIterator<T> rng_cones_iterator(const std::vector<AbstractCone<T>>& cones) {
+    return RangeConesIterator<T>(cones);
+}
 
-function rng_cones_iterator(cones::Vector{AbstractCone{T}}) where{T}
-    RangeConesIterator(cones)
-end
+template <typename T>
+RangeBlocksIterator<T> rng_blocks_iterator(const std::vector<AbstractCone<T>>& cones, bool use_gpu) {
+    return use_gpu ? RangeBlocksIteratorFull<T>(cones) : RangeBlocksIterator<T>(cones);
+}
 
-function rng_blocks_iterator(cones::Vector{AbstractCone{T}},use_gpu) where{T}
-    use_gpu ? RangeBlocksIteratorFull(cones) : RangeBlocksIterator(cones)
-end
+template <typename T>
+class RangeBlocksIteratorFull {
+public:
+    RangeBlocksIteratorFull(const std::vector<AbstractCone<T>>& cones) : cones(cones) {}
 
-Base.length(iter::RangeConesIterator) =  length(iter.cones)
-Base.length(iter::RangeBlocksIterator) = length(iter.cones)
+    auto begin() const {
+        return cones.begin();
+    }
 
-function Base.iterate(iter::RangeConesIterator, state=(1, 1)) 
-    (coneidx, start) = state 
-    if coneidx > length(iter.cones)
-        return nothing 
-    else 
-        nvars = numel(iter.cones[coneidx])
-        stop  = start + nvars - 1
-        state = (coneidx + 1, stop + 1)
-        return (start:stop, state)
-    end 
-end 
+    auto end() const {
+        return cones.end();
+    }
 
-function Base.iterate(iter::RangeBlocksIterator, state=(1, 1)) 
-    (coneidx, start) = state 
-    if coneidx > length(iter.cones)
-        return nothing 
-    else 
-        cone = iter.cones[coneidx]
-        nvars = numel(cone)
-        if Hs_is_diagonal(cone)
-            stop = start + nvars - 1
-        else
-            stop = start + triangular_number(nvars) - 1
-        end
-        state = (coneidx + 1, stop + 1)
-        return (start:stop, state)
-    end 
-end 
+private:
+    const std::vector<AbstractCone<T>>& cones;
+};
 
+template <typename T>
+RangeBlocksIteratorFull<T> rng_blocks_iterator_full(const std::vector<AbstractCone<T>>& cones) {
+    return RangeBlocksIteratorFull<T>(cones);
+}
 
-# -------------------------------------
-# iterators to generate indices into vectors 
-# in a cone or cone-related blocks in the Hessian
-struct RangeBlocksIteratorFull{T} 
-    cones::AbstractVector{AbstractCone{T}}
-end
-
-function rng_blocks_iterator_full(cones::Vector{AbstractCone{T}}) where{T}
-    RangeBlocksIteratorFull(cones)
-end
-
-Base.length(iter::RangeBlocksIteratorFull) = length(iter.cones)
-
-function Base.iterate(iter::RangeBlocksIteratorFull, state=(1, 1)) 
-    (coneidx, start) = state 
-    if coneidx > length(iter.cones)
-        return nothing 
-    else 
-        cone = iter.cones[coneidx]
-        nvars = numel(cone)
-        if Hs_is_diagonal(cone)
-            stop = start + nvars - 1
-        else
-            stop = start + nvars*nvars - 1
-        end
-        state = (coneidx + 1, stop + 1)
-        return (start:stop, state)
-    end 
-end 
+} // namespace Clarabel
