@@ -106,7 +106,7 @@ public:
         int max_linear = std::max_element(cones.begin(), cones.begin() + n_linear, [](AbstractCone<T>* a, AbstractCone<T>* b) {
             return a->numel() < b->numel();
         })->numel();
-        int numel_soc = std::accumulate(cones.begin() + n_linear, cones.begin() + n_linear + n_soc, 0, [](int sum, AbstractCone<T>* cone) {
+        int numel_soc = std::accumulate(cones.begin(), cones.begin() + n_linear + n_soc, 0, [](int sum, AbstractCone<T>* cone) {
             return sum + cone->numel();
         });
 

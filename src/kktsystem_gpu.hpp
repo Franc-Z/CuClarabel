@@ -15,7 +15,6 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/iterator/discard_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
-#include <thrust/iterator/zip_function.h>
 
 template <typename T>
 class DefaultKKTSystemGPU {
