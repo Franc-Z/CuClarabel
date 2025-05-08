@@ -18,7 +18,7 @@ struct CUDSSDirectLDLSolver{T} <: AbstractDirectLDLSolver{T}
         # "S" denotes real symmetric and 'U' denotes the upper triangular
 
         cudssSolver = CUDSS.CudssSolver(KKT, "S", 'F')
-
+        cudss_set(cudssSolver, "hybrid_execute_mode", true)    # only for CUDSS.jl V0.5.0
         cudss("analysis", cudssSolver, x, b)
         cudss("factorization", cudssSolver, x, b)
 
