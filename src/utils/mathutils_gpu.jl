@@ -135,7 +135,7 @@ function _kernel_lrscale_gpu!(L::AbstractVector{T}, M::AbstractSparseMatrix{T}, 
 	return nothing
 end
 
-@inline function lrscale_gpu!(L::AbstractVector{T}, M::AbstractSparseMatrix{T}, R::AbstractVector{T}) where {T <: AbstractFloat}
+@inline function lrscale_gpu!(L::AbstractVector{T}, M::AbstractSparseMatrix{T}, R::AbstractVector{T})::Nothing where {T <: AbstractFloat}
 
 	m, n = size(M)
 	(m == length(L) && n == length(R)) || throw(DimensionMismatch())
