@@ -229,7 +229,8 @@ end
 Computes the solution to the problem in a `Clarabel.Solver` previously defined in [`setup!`](@ref).
 """
 function solve!(
-    s::Solver{T}
+    s::Solver{T},
+    warm_start::Bool = false
 ) where{T}
 
     # initialization needed for first loop pass 
@@ -251,7 +252,44 @@ function solve!(
     @timeit s.timers "solve!" begin
 
         # initialize variables to some reasonable starting point
-        @timeit s.timers "default start" solver_default_start!(s)
+        if warm_start
+            # 1. 保存求解器当前状态  
+            #saved_vars = deepcopy(s.variables)  
+            
+            # 2. 更新问题数据  
+            #update_data!(s, P_new, q_new, A_new, b_new)  
+            
+            # 3. 从上一个解初始化变量  
+            s.variables.x .= s.solution.x  
+            s.variables.z .= s.solution.z  
+            s.variables.s .= s.solution.s  
+            
+            # 4. 确保变量在锥内部  
+            # 计算锥边界距离  
+            (min_margin_s, _) = Clarabel.margins(s.cones, s.variables.s, Clarabel.PrimalCone)  
+            (min_margin_z, _) = Clarabel.margins(s.cones, s.variables.z, Clarabel.DualCone)  
+
+            # 如果点在锥边界外或过近，调整到锥内部  
+            if min_margin_s <= 0.01  
+                # 向锥内部移动  
+                Clarabel._shift_to_cone_interior!(s.variables.s, s.cones, Clarabel.PrimalCone)  
+            end  
+            
+            if min_margin_z <= 0.01  
+                # 向锥内部移动  
+                Clarabel._shift_to_cone_interior!(s.variables.z, s.cones, Clarabel.DualCone)  
+            end  
+
+            # 5. 确保变量被正确缩放  
+            # 根据τ和κ缩放变量以保持同质性  
+            Clarabel.variables_rescale!(s.variables)  
+            
+            # 6. 更新KKT系统  
+            Clarabel.kkt_update!(s.kktsystem, s.data, s.cones)  
+            Clarabel.kkt_solve_initial_point!(s.kktsystem,s.variables,s.data)
+        else
+            @timeit s.timers "default start" solver_default_start!(s)
+        end
 
         @timeit s.timers "IP iteration" begin
 
