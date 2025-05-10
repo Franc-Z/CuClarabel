@@ -234,7 +234,7 @@ function solve!(
 ) where{T}
 
     # initialization needed for first loop pass 
-    iter   = 0
+    iter = 0
     σ = one(T) 
     α = zero(T)
     μ = typemax(T)
@@ -248,45 +248,37 @@ function solve!(
     end
 
     info_reset!(s.info,s.timers)
-
-    @timeit s.timers "solve!" begin
-
+    
+    @timeit s.timers "solve!" begin  
         # initialize variables to some reasonable starting point
         if warm_start
-            # 1. 保存求解器当前状态  
-            #saved_vars = deepcopy(s.variables)  
-            
-            # 2. 更新问题数据  
-            #update_data!(s, P_new, q_new, A_new, b_new)  
-            
             # 3. 从上一个解初始化变量  
-            s.variables.x .= s.solution.x  
-            s.variables.z .= s.solution.z  
-            s.variables.s .= s.solution.s  
-            
-            # 4. 确保变量在锥内部  
-            # 计算锥边界距离  
-            (min_margin_s, _) = Clarabel.margins(s.cones, s.variables.s, Clarabel.PrimalCone)  
-            (min_margin_z, _) = Clarabel.margins(s.cones, s.variables.z, Clarabel.DualCone)  
+            s.variables.x .= s.prev_vars.x
+            s.variables.z .= s.prev_vars.z
+            s.variables.s .= s.prev_vars.s 
+            #variables_rescale!(s.variables)             
+            # 确保s和z在各自的锥内部  
+            (min_margin_s, _) = margins(s.cones, s.variables.s, PrimalCone)  
+            (min_margin_z, _) = margins(s.cones, s.variables.z, DualCone)  
 
             # 如果点在锥边界外或过近，调整到锥内部  
             if min_margin_s <= 0.01  
                 # 向锥内部移动  
-                Clarabel._shift_to_cone_interior!(s.variables.s, s.cones, Clarabel.PrimalCone)  
+                _shift_to_cone_interior!(s.variables.s, s.cones, PrimalCone)  
             end  
             
             if min_margin_z <= 0.01  
                 # 向锥内部移动  
-                Clarabel._shift_to_cone_interior!(s.variables.z, s.cones, Clarabel.DualCone)  
+                _shift_to_cone_interior!(s.variables.z, s.cones, DualCone)  
             end  
-
-            # 5. 确保变量被正确缩放  
-            # 根据τ和κ缩放变量以保持同质性  
-            Clarabel.variables_rescale!(s.variables)  
             
-            # 6. 更新KKT系统  
-            Clarabel.kkt_update!(s.kktsystem, s.data, s.cones)  
-            Clarabel.kkt_solve_initial_point!(s.kktsystem,s.variables,s.data)
+            # 设置τ和κ为正值  
+            s.variables.τ = s.prev_vars.τ
+            s.variables.κ = s.prev_vars.κ
+
+            # 更新KKT系统  
+            kkt_update!(s.kktsystem, s.data, s.cones)  
+
         else
             @timeit s.timers "default start" solver_default_start!(s)
         end
