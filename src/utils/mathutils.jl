@@ -32,10 +32,10 @@ end
     @assert(length(z) == length(dz))
     @assert(length(s) == length(ds))
     
-    out = zero(T)
+    out::T = zero(T)
     @inbounds for i in eachindex(z) 
-        zi = z[i] + α*dz[i]
-        si = s[i] + α*ds[i]
+        zi::T = z[i] + α*dz[i]
+        si::T = s[i] + α*ds[i]
         out += zi*si
     end 
     return out
@@ -254,7 +254,7 @@ function quad_form(
     x::AbstractArray{Tf},
     A::Symmetric{Tf,SparseMatrixCSC{Tf,Ti}},
     y::AbstractArray{Tf}
-    ) where{Tf <: Real,Ti}
+    )::Tf where{Tf <: Real,Ti}
 
     if(A.uplo != 'U')
         error("Only implemented for upper triangular matrices")
