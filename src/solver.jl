@@ -261,8 +261,7 @@ function solve!(
             
             # 更新KKT系统  
             kkt_update!(s.kktsystem, s.data, s.cones)  
-            #kkt_solve_initial_point!(s.kktsystem,s.variables,s.data)
-            #variables_rescale!(s.variables)             
+                        
             # 确保s和z在各自的锥内部  
             (min_margin_s, _) = margins(s.cones, s.variables.s, PrimalCone)  
             (min_margin_z, _) = margins(s.cones, s.variables.z, DualCone)  
