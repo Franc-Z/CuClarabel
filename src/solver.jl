@@ -251,11 +251,17 @@ function solve!(
     
     @timeit s.timers "solve!" begin  
         # initialize variables to some reasonable starting point
-        if warm_start
-            # 3. 从上一个解初始化变量  
+	if warm_start
+            # 从上一个解初始化变量   
             s.variables.x .= s.prev_vars.x
             s.variables.z .= s.prev_vars.z
             s.variables.s .= s.prev_vars.s 
+            s.variables.τ = s.prev_vars.τ
+            s.variables.κ = s.prev_vars.κ
+            
+            # 更新KKT系统  
+            kkt_update!(s.kktsystem, s.data, s.cones)  
+            #kkt_solve_initial_point!(s.kktsystem,s.variables,s.data)
             #variables_rescale!(s.variables)             
             # 确保s和z在各自的锥内部  
             (min_margin_s, _) = margins(s.cones, s.variables.s, PrimalCone)  
@@ -272,13 +278,6 @@ function solve!(
                 _shift_to_cone_interior!(s.variables.z, s.cones, DualCone)  
             end  
             
-            # 设置τ和κ为正值  
-            s.variables.τ = s.prev_vars.τ
-            s.variables.κ = s.prev_vars.κ
-
-            # 更新KKT系统  
-            kkt_update!(s.kktsystem, s.data, s.cones)  
-
         else
             @timeit s.timers "default start" solver_default_start!(s)
         end
