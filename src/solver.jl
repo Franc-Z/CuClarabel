@@ -259,23 +259,13 @@ function solve!(
             s.variables.τ = s.prev_vars.τ
             s.variables.κ = s.prev_vars.κ
             
-            # 更新KKT系统  
+            # 更新KKT系统 
+	    kkt_solve_initial_point!(s.kktsystem,s.variables,s.data)
             kkt_update!(s.kktsystem, s.data, s.cones)  
                         
-            # 确保s和z在各自的锥内部  
-            (min_margin_s, _) = margins(s.cones, s.variables.s, PrimalCone)  
-            (min_margin_z, _) = margins(s.cones, s.variables.z, DualCone)  
-
-            # 如果点在锥边界外或过近，调整到锥内部  
-            if min_margin_s <= 0.01  
-                # 向锥内部移动  
-                _shift_to_cone_interior!(s.variables.s, s.cones, PrimalCone)  
-            end  
-            
-            if min_margin_z <= 0.01  
-                # 向锥内部移动  
-                _shift_to_cone_interior!(s.variables.z, s.cones, DualCone)  
-            end  
+            # 向锥内部移动  
+            _shift_to_cone_interior!(s.variables.s, s.cones, PrimalCone)  
+            _shift_to_cone_interior!(s.variables.z, s.cones, DualCone)  
             
         else
             @timeit s.timers "default start" solver_default_start!(s)
