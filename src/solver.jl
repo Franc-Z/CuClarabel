@@ -260,7 +260,7 @@ function solve!(
             s.variables.κ = s.prev_vars.κ
             
             # 更新KKT系统 
-	    kkt_solve_initial_point!(s.kktsystem,s.variables,s.data)
+	    #kkt_solve_initial_point!(s.kktsystem,s.variables,s.data)
             kkt_update!(s.kktsystem, s.data, s.cones)  
                         
             # 向锥内部移动  
