@@ -54,6 +54,7 @@ function solve!(
 ) where{T}
     
     #solve on GPU
-    ldiv!(x,ldlsolver.cudssSolver,b)
+    #ldiv!(x,ldlsolver.cudssSolver,b)
+    cudss("solve", ldlsolver.cudssSolver, x, b)
 
 end
