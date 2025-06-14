@@ -71,6 +71,13 @@ struct CompositeConeGPU{T} <: AbstractCone{T}
     function CompositeConeGPU{T}(cone_specs::Vector{SupportedCone}, soc_threshold::Int) where {T}
 
         #Information from the CompositeCone on CPU 
+        cone_orders = map(c -> orders(c, soc_threshold), cone_specs)
+        #Guarantee the input cones are ordered
+        if !issorted(cone_orders)Add commentMore actions
+            error("The input cones should be ordered!")
+        end
+        cone_orders = nothing
+        
         n_zero = count(x -> typeof(x) == ZeroConeT, cone_specs)
         n_nn = count(x -> typeof(x) == NonnegativeConeT, cone_specs)
         n_linear = n_zero + n_nn
