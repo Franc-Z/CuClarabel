@@ -89,6 +89,23 @@ function degrees(cone::SupportedCone)
     end
 end
 
+# this reports the priority of a cone (used for GPU)
+function orders(cone::SupportedCone, soc_threshold::Int)
+    
+    if isa(cone, ZeroConeT)
+        0
+    elseif isa(cone, NonnegativeConeT)
+        0
+    elseif isa(cone, SecondOrderConeT)
+        (cone.dim > soc_threshold) ? 2 : 1
+    elseif isa(cone, ExponentialConeT)
+        3
+    elseif isa(cone, PowerConeT)
+        4
+    else
+        5
+    end
+end
 # we use the SupportedCone as a user facing marker
 # for the constraint types, and then map them through
 # make_cone to get the internal cone representations.
