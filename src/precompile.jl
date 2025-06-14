@@ -167,8 +167,8 @@ end
 
 function __precompile_gpu()
     cones = [
-        Clarabel.NonnegativeConeT(1),
         Clarabel.ZeroConeT(1),
+        Clarabel.NonnegativeConeT(1),
         Clarabel.SecondOrderConeT(2),
         Clarabel.ExponentialConeT(),
         Clarabel.PowerConeT(0.5),
