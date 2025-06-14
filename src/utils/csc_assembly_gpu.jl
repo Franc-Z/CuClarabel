@@ -236,9 +236,11 @@ end
     rng_cones = cones.rng_cones
 
     #Count the diagonal Hessian parts for zero, nonnegative and sparse second-order cones
-    CUDA.@allowscalar begin 
-        rng = (one(Cint):rng_cones[n_linear+n_sparse_soc].stop) .+ (n + one(Cint)) 
-        CUDA.@sync @views @. rowptr[rng] += 1
+    if (n_linear + n_sparse_soc) > 0
+        CUDA.@allowscalar begin 
+            rng = (one(Cint):rng_cones[n_linear+n_sparse_soc].stop) .+ (n + one(Cint)) 
+            CUDA.@sync @views @. rowptr[rng] += 1
+        end
     end
     
     #Count the additional sparse mapping for SOCs
@@ -483,11 +485,13 @@ end
     n_sparse_soc = cones.n_sparse_soc
 
     #Fill the diagonal Hessian parts for zero, nonnegative and sparse second-order cones
-    CUDA.@allowscalar begin
-        block = view(map.Hsblocks,one(Cint):(rng_blocks[n_linear+n_sparse_soc].stop))
-        _csr_fill_diag_gpu(rowptr, colval, nzval, block, n + one(Cint), Cint(length(block)))
+    if (n_linear + n_sparse_soc) > 0
+        CUDA.@allowscalar begin
+            block = view(map.Hsblocks, one(Cint):(rng_blocks[n_linear+n_sparse_soc].stop))
+            _csr_fill_diag_gpu(rowptr, colval, nzval, block, n + one(Cint), Cint(length(block)))
+        end
+        CUDA.synchronize()
     end
-    CUDA.synchronize()
 
     # Initializing additional rows (columns) for sparse second-order cones
     # track the next sparse row to fill
