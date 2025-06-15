@@ -73,7 +73,7 @@ struct CompositeConeGPU{T} <: AbstractCone{T}
         #Information from the CompositeCone on CPU 
         cone_orders = map(c -> orders(c, soc_threshold), cone_specs)
         #Guarantee the input cones are ordered
-        if !issorted(cone_orders)Add commentMore actions
+        if !issorted(cone_orders)
             error("The input cones should be ordered!")
         end
         cone_orders = nothing
