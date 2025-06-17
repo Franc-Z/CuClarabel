@@ -2,6 +2,72 @@
 # # Second Order Cone
 # # ----------------------------------------------------
 
+# ===== 优化版本的辅助函数 =====
+# 用于并行规约的辅助函数
+@inline function warp_reduce_sum(val::T) where T
+    offset = 16
+    while offset > 0
+        val += CUDA.shfl_down_sync(0xffffffff, val, offset)
+        offset >>= 1
+    end
+    return val
+end
+
+@inline function block_reduce_sum(val::T, shared_mem) where T
+    tid = threadIdx().x
+    wid = (tid - 1) ÷ 32 + 1
+    lane = (tid - 1) % 32 + 1
+    
+    # Warp级规约
+    val = warp_reduce_sum(val)
+    
+    # 将每个warp的结果写入共享内存
+    if lane == 1
+        shared_mem[wid] = val
+    end
+    sync_threads()
+    
+    # 最后一个warp进行最终规约
+    if wid == 1
+        val = tid <= (blockDim().x ÷ 32) ? shared_mem[tid] : zero(T)
+        val = warp_reduce_sum(val)
+    end
+    
+    return val
+end
+
+# 智能选择器：根据cone特征判断是否使用优化版本
+@inline function should_use_optimized_version(rng_cones::AbstractVector, n_shift::Cint, n_soc::Cint)
+    if n_soc == 0
+        return false
+    end
+    
+    # 计算平均cone大小
+    total_size = 0
+    CUDA.@allowscalar for i in 1:n_soc
+        total_size += length(rng_cones[i + n_shift])
+    end
+    avg_size = total_size ÷ n_soc
+    
+    # 如果cone数量少且平均大小大，使用优化版本
+    return n_soc <= 8 && avg_size >= 1000
+end
+
+# 获取优化版本的线程配置
+@inline function get_optimized_config(rng_cones::AbstractVector, n_shift::Cint, n_soc::Cint)
+    max_cone_size = 0
+    CUDA.@allowscalar for i in 1:n_soc
+        max_cone_size = max(max_cone_size, length(rng_cones[i + n_shift]))
+    end
+    
+    threads_per_cone = min(1024, max(128, nextpow(2, ceil(Int, sqrt(max_cone_size)))))
+    shared_mem_size = threads_per_cone ÷ 32 + 8  # 额外空间用于存储中间结果
+    
+    return (threads=threads_per_cone, shared_mem_size=shared_mem_size)
+end
+
+# ===== 原始版本的kernel（保持不变） =====
+
 function _kernel_margins_soc(
     z::AbstractVector{T},
     α::AbstractVector{T},
@@ -27,6 +93,122 @@ function _kernel_margins_soc(
     return nothing
 end
 
+# ===== 优化版本的kernel =====
+
+# 优化版本的margin计算kernel - 使用块内并行处理每个cone
+function _kernel_margins_soc_optimized(
+    z::AbstractVector{T},
+    α::AbstractVector{T},
+    rng_cones::AbstractVector,
+    n_shift::Cint,
+    n_soc::Cint
+) where{T}
+    # 使用二维网格：x维度是cone索引
+    cone_idx = blockIdx().x
+    tid = threadIdx().x
+    
+    # 共享内存用于规约
+    shared_mem = @cuDynamicSharedMem(T, blockDim().x ÷ 32)
+    
+    if cone_idx <= n_soc
+        shift_i = cone_idx + n_shift
+        rng_cone_i = rng_cones[shift_i]
+        size_i = length(rng_cone_i)
+        @views zi = z[rng_cone_i]
+        
+        # 每个线程处理cone内的多个元素
+        val = zero(T)
+        # 从索引2开始，步长为blockDim().x
+        idx = 2 + (tid - 1)  # 第1个线程处理索引2，第2个线程处理索引3，等等
+        while idx <= size_i
+            val += zi[idx] * zi[idx]
+            idx += blockDim().x
+        end
+        
+        # 块内规约求和
+        val = block_reduce_sum(val, shared_mem)
+        
+        # 线程0计算最终结果
+        if tid == 1
+            α[cone_idx] = zi[1] - sqrt(val)
+        end
+    end
+    
+    return nothing
+end
+
+# ===== 单个大型SOC的特殊kernel =====
+
+# 单个大型cone的margins计算kernel
+function _kernel_margins_soc_single_cone(
+    z::AbstractVector{T},
+    α::AbstractVector{T},
+    rng_cone,
+    cone_size::Cint
+) where{T}
+    tid = Cint(threadIdx().x)
+    bid = blockIdx().x
+    
+    # 共享内存用于warp规约
+    shared_mem = @cuDynamicSharedMem(T, cld(blockDim().x, 32))
+    
+    # 每个线程计算部分和
+    local_sum = zero(T)
+    idx = tid + (bid - 1) * blockDim().x
+    
+    while idx <= cone_size - 1  # 从索引2开始
+        @inbounds local_sum += z[rng_cone.start + idx] * z[rng_cone.start + idx]
+        idx += gridDim().x * blockDim().x
+    end
+    
+    # 使用优化的block规约
+    warp_id = (tid - 1) ÷ 32 + 1
+    lane_id = (tid - 1) % 32 + 1
+    
+    # Warp级规约
+    local_sum = warp_reduce_sum(local_sum)
+    
+    # 将warp结果写入共享内存
+    if lane_id == 1
+        @inbounds shared_mem[warp_id] = local_sum
+    end
+    sync_threads()
+    
+    # 最终规约
+    if tid <= 32
+        @inbounds local_sum = tid <= cld(blockDim().x, 32) ? shared_mem[tid] : zero(T)
+        local_sum = warp_reduce_sum(local_sum)
+    end
+    
+    # 第一个线程写入结果
+    if tid == 1
+        if gridDim().x > 1
+            # 多个块：累加部分和
+            CUDA.@atomic α[1] += local_sum
+        else
+            # 单个块：直接计算最终结果
+            @inbounds α[1] = z[rng_cone.start] - sqrt(local_sum)
+        end
+    end
+    
+    return nothing
+end
+
+# 单个cone margin计算的最终化
+function _finalize_margins_soc_single_cone(
+    z::AbstractVector{T},
+    α::AbstractVector{T},
+    rng_cone
+) where{T}
+    CUDA.@allowscalar begin
+        val = α[1]
+        α[1] = z[rng_cone.start] - sqrt(val)
+    end
+    return nothing
+end
+
+# ===== 统一的调用接口（智能选择版本） =====
+
 @inline function margins_soc(
     z::AbstractVector{T},
     α::AbstractVector{T},
@@ -35,17 +217,63 @@ end
     n_soc::Cint,
     αmin::T
 ) where{T}
-    kernel = @cuda launch=false _kernel_margins_soc(z, α, rng_cones, n_shift, n_soc)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_soc, config.threads)
-    blocks = cld(n_soc, threads)
-
-    CUDA.@sync kernel(z, α, rng_cones, n_shift, n_soc; threads, blocks)
-
-    @views αsoc = α[1:n_soc]
-    αmin = min(αmin,minimum(αsoc))
-    CUDA.@sync @. αsoc = max(zero(T),αsoc)
-    return (αmin, sum(αsoc))
+    if n_soc == 1
+        # 特殊优化：单个大型cone
+        CUDA.@allowscalar begin
+            rng_cone = rng_cones[n_shift + 1]
+            cone_size = Cint(length(rng_cone))
+        end
+        
+        # 初始化α[1]为0用于原子累加
+        CUDA.@allowscalar α[1] = zero(T)
+        
+        # 使用单个cone优化kernel
+        kernel = @cuda launch=false _kernel_margins_soc_single_cone(z, α, rng_cone, cone_size)
+        config = launch_configuration(kernel.fun)
+        threads = min(256, config.threads)
+        blocks = min(256, cld(cone_size - 1, threads))  # -1因为跳过第一个元素
+        
+        # 分配共享内存用于warp规约
+        shmem_size = cld(threads, 32) * sizeof(T)
+        CUDA.@sync kernel(z, α, rng_cone, cone_size; threads, blocks, shmem=shmem_size)
+        
+        # 如果使用了多个块，最终化计算
+        if blocks > 1
+            _finalize_margins_soc_single_cone(z, α, rng_cone)
+        end
+        
+        CUDA.@allowscalar begin
+            αmin = min(αmin, α[1])
+            α[1] = max(zero(T), α[1])
+            return (αmin, α[1])
+        end
+    elseif should_use_optimized_version(rng_cones, n_shift, n_soc)
+        # 使用优化版本（少量大型cone）
+        config = get_optimized_config(rng_cones, n_shift, n_soc)
+        shared_mem_size = sizeof(T) * config.shared_mem_size
+        
+        kernel = @cuda launch=false _kernel_margins_soc_optimized(z, α, rng_cones, n_shift, n_soc)
+        CUDA.@sync kernel(z, α, rng_cones, n_shift, n_soc; 
+                         threads=config.threads, blocks=n_soc, shmem=shared_mem_size)
+        
+        @views αsoc = α[1:n_soc]
+        αmin = min(αmin,minimum(αsoc))
+        CUDA.@sync @. αsoc = max(zero(T),αsoc)
+        return (αmin, sum(αsoc))
+    else
+        # 使用原始版本
+        kernel = @cuda launch=false _kernel_margins_soc(z, α, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = min(n_soc, config.threads)
+        blocks = cld(n_soc, threads)
+        
+        CUDA.@sync kernel(z, α, rng_cones, n_shift, n_soc; threads, blocks)
+        
+        @views αsoc = α[1:n_soc]
+        αmin = min(αmin,minimum(αsoc))
+        CUDA.@sync @. αsoc = max(zero(T),αsoc)
+        return (αmin, sum(αsoc))
+    end
 end
 
 # place vector into socone
@@ -76,13 +304,41 @@ end
     n_shift::Cint,
     n_soc::Cint   
 ) where{T}
+    if n_soc == 1
+        # 特殊优化：单个大型cone - 只需要给第一个元素加α
+        CUDA.@allowscalar begin
+            rng_cone = rng_cones[n_shift + 1]
+            z[rng_cone.start] += α
+        end
+    else
+        # 原始实现：多个cone
+        kernel = @cuda launch=false _kernel_scaled_unit_shift_soc!(z, α, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = min(n_soc, config.threads)
+        blocks = cld(n_soc, threads)
 
-    kernel = @cuda launch=false _kernel_scaled_unit_shift_soc!(z, α, rng_cones, n_shift, n_soc)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_soc, config.threads)
-    blocks = cld(n_soc, threads)
+        CUDA.@sync kernel(z, α, rng_cones, n_shift, n_soc; threads, blocks)
+    end
+end
 
-    CUDA.@sync kernel(z, α, rng_cones, n_shift, n_soc; threads, blocks)
+# 单个大型cone的unit initialization kernel
+function _kernel_unit_initialization_soc_single_cone!(
+    z::AbstractVector{T},
+    s::AbstractVector{T},
+    rng_cone,
+    cone_size::Cint
+) where{T}
+    idx = (blockIdx().x-1)*blockDim().x+threadIdx().x
+    
+    if idx == 1
+        @inbounds z[rng_cone.start] = one(T)
+        @inbounds s[rng_cone.start] = one(T)
+    elseif idx <= cone_size
+        @inbounds z[rng_cone.start + idx - 1] = zero(T)
+        @inbounds s[rng_cone.start + idx - 1] = zero(T)
+    end
+    
+    return nothing
 end
 
 # unit initialization for asymmetric solves
@@ -115,6 +371,44 @@ function _kernel_unit_initialization_soc!(
     return nothing
 end 
 
+# 优化版本的unit initialization
+function _kernel_unit_initialization_soc_optimized!(
+    z::AbstractVector{T},
+    s::AbstractVector{T},
+    rng_cones::AbstractVector,
+    n_linear::Cint,
+    n_soc::Cint
+) where{T}
+    cone_idx = blockIdx().x
+    tid = threadIdx().x
+    
+    if cone_idx <= n_soc
+        shift_i = cone_idx + n_linear
+        rng_cone_i = rng_cones[shift_i]
+        size_i = length(rng_cone_i)
+        @views zi = z[rng_cone_i]
+        @views si = s[rng_cone_i]
+        
+        # 并行初始化
+        if tid == 1
+            zi[1] = one(T)
+            si[1] = one(T)
+        end
+        
+        # 其他线程处理剩余元素
+        idx = tid + 1
+        while idx <= size_i
+            if idx > 1
+                zi[idx] = zero(T)
+                si[idx] = zero(T)
+            end
+            idx += blockDim().x
+        end
+    end
+    
+    return nothing
+end
+
 @inline function unit_initialization_soc!(
     z::AbstractVector{T},
     s::AbstractVector{T},
@@ -122,14 +416,53 @@ end
     n_shift::Cint,
     n_soc::Cint
 ) where{T}
+    if n_soc == 1
+        # 特殊优化：单个大型cone
+        CUDA.@allowscalar begin
+            rng_cone = rng_cones[n_shift + 1]
+            cone_size = Cint(length(rng_cone))
+        end
+        
+        kernel = @cuda launch=false _kernel_unit_initialization_soc_single_cone!(z, s, rng_cone, cone_size)
+        config = launch_configuration(kernel.fun)
+        threads = min(cone_size, config.threads)
+        blocks = cld(cone_size, threads)
+        
+        CUDA.@sync kernel(z, s, rng_cone, cone_size; threads, blocks)
+    elseif should_use_optimized_version(rng_cones, n_shift, n_soc)
+        # 使用优化版本（少量大型cone）
+        config = get_optimized_config(rng_cones, n_shift, n_soc)
+        kernel = @cuda launch=false _kernel_unit_initialization_soc_optimized!(z, s, rng_cones, n_shift, n_soc)
+        CUDA.@sync kernel(z, s, rng_cones, n_shift, n_soc; threads=config.threads, blocks=n_soc)
+    else
+        # 使用原始版本
+        kernel = @cuda launch=false _kernel_unit_initialization_soc!(z, s, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = min(n_soc, config.threads)
+        blocks = cld(n_soc, threads)
+        
+        CUDA.@sync kernel(z, s, rng_cones, n_shift, n_soc; threads, blocks)
+    end
+end
 
-    kernel = @cuda launch=false _kernel_unit_initialization_soc!(z, s, rng_cones, n_shift, n_soc)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_soc, config.threads)
-    blocks = cld(n_soc, threads)
-
-    CUDA.@sync kernel(z, s, rng_cones, n_shift, n_soc; threads, blocks)
-end 
+# 单个大型cone的identity scaling kernel
+function _kernel_set_identity_scaling_soc_single_cone!(
+    w::AbstractVector{T},
+    η::AbstractVector{T},
+    rng_cone,
+    cone_size::Cint
+) where{T}
+    idx = (blockIdx().x-1)*blockDim().x+threadIdx().x
+    
+    if idx == 1
+        @inbounds w[rng_cone.start] = one(T)
+        @inbounds η[1] = one(T)
+    elseif idx <= cone_size
+        @inbounds w[rng_cone.start + idx - 1] = zero(T)
+    end
+    
+    return nothing
+end
 
 # # configure cone internals to provide W = I scaling
 function _kernel_set_identity_scaling_soc!(
@@ -164,12 +497,28 @@ end
     n_shift::Cint,
     n_soc::Cint
 ) where {T}
-    kernel = @cuda launch=false _kernel_set_identity_scaling_soc!(w, η, rng_cones, n_shift, n_soc)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_soc, config.threads)
-    blocks = cld(n_soc, threads)
+    if n_soc == 1
+        # 特殊优化：单个大型cone
+        CUDA.@allowscalar begin
+            rng_cone = rng_cones[n_shift + 1]
+            cone_size = Cint(length(rng_cone))
+        end
+        
+        kernel = @cuda launch=false _kernel_set_identity_scaling_soc_single_cone!(w, η, rng_cone, cone_size)
+        config = launch_configuration(kernel.fun)
+        threads = min(cone_size, config.threads)
+        blocks = cld(cone_size, threads)
+        
+        CUDA.@sync kernel(w, η, rng_cone, cone_size; threads, blocks)
+    else
+        # 原始实现：多个cone
+        kernel = @cuda launch=false _kernel_set_identity_scaling_soc!(w, η, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = min(n_soc, config.threads)
+        blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(w, η, rng_cones, n_shift, n_soc; threads, blocks)
+        CUDA.@sync kernel(w, η, rng_cones, n_shift, n_soc; threads, blocks)
+    end
 end
 
 @inline function set_identity_scaling_soc_sparse!(
@@ -255,6 +604,181 @@ function _kernel_update_scaling_soc!(
     return nothing
 end
 
+# 优化版本的update scaling kernel
+function _kernel_update_scaling_soc_optimized!(
+    s::AbstractVector{T},
+    z::AbstractVector{T},
+    w::AbstractVector{T},
+    λ::AbstractVector{T},
+    η::AbstractVector{T},
+    rng_cones::AbstractVector,
+    n_shift::Cint,
+    n_soc::Cint
+) where {T}
+    cone_idx = blockIdx().x
+    tid = threadIdx().x
+    
+    # 共享内存分配
+    shared_size = blockDim().x ÷ 32 + 4  # 额外空间存储中间结果
+    shared_mem = @cuDynamicSharedMem(T, shared_size)
+    
+    if cone_idx <= n_soc
+        shift_i = cone_idx + n_shift
+        rng_i = rng_cones[shift_i]
+        size_i = length(rng_i)
+        @views zi = z[rng_i]
+        @views si = s[rng_i]
+        @views wi = w[rng_i]
+        @views λi = λ[rng_i]
+        
+        # 并行计算z的residual = z[1]^2 - sum(z[2:end].^2)
+        val_z = zero(T)
+        # 每个线程计算部分元素
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                val_z += zi[idx] * zi[idx]  # 第1个元素是正的
+            else
+                val_z -= zi[idx] * zi[idx]  # 其余元素是负的
+            end
+            idx += blockDim().x
+        end
+        val_z = block_reduce_sum(val_z, shared_mem)
+        
+        sync_threads()
+        
+        # 存储zscale到共享内存
+        if tid == 1
+            shared_mem[end-3] = val_z > 0 ? sqrt(val_z) : zero(T)
+        end
+        sync_threads()
+        zscale = shared_mem[end-3]
+        
+        # 并行计算s的residual = s[1]^2 - sum(s[2:end].^2)
+        val_s = zero(T)
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                val_s += si[idx] * si[idx]  # 第1个元素是正的
+            else
+                val_s -= si[idx] * si[idx]  # 其余元素是负的
+            end
+            idx += blockDim().x
+        end
+        val_s = block_reduce_sum(val_s, shared_mem)
+        
+        sync_threads()
+        
+        # 存储sscale到共享内存
+        if tid == 1
+            shared_mem[end-2] = val_s > 0 ? sqrt(val_s) : zero(T)
+        end
+        sync_threads()
+        sscale = shared_mem[end-2]
+        
+        # 设置η
+        if tid == 1
+            η[cone_idx] = sqrt(sscale/zscale)
+        end
+        
+        # 并行构建w
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                w[rng_i[idx]] = s[rng_i[idx]]/sscale + zi[1]/zscale
+            else
+                w[rng_i[idx]] = s[rng_i[idx]]/sscale - zi[idx]/zscale
+            end
+            idx += blockDim().x
+        end
+        
+        sync_threads()
+        
+        # 计算w的residual用于归一化
+        val_w = zero(T)
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                val_w += wi[idx] * wi[idx]
+            else
+                val_w -= wi[idx] * wi[idx]
+            end
+            idx += blockDim().x
+        end
+        val_w = block_reduce_sum(val_w, shared_mem)
+        
+        sync_threads()
+        
+        if tid == 1
+            shared_mem[end-1] = val_w > 0 ? sqrt(val_w) : zero(T)
+        end
+        sync_threads()
+        wscale = shared_mem[end-1]
+        
+        # 并行归一化w
+        idx = tid
+        while idx <= size_i
+            wi[idx] /= wscale
+            idx += blockDim().x
+        end
+        
+        sync_threads()
+        
+        # 强制归一化（计算w1sq = sum(w[2:end].^2)）
+        val_w1sq = zero(T)
+        idx = 2 + (tid - 1)  # 从索引2开始
+        while idx <= size_i
+            val_w1sq += wi[idx] * wi[idx]
+            idx += blockDim().x
+        end
+        val_w1sq = block_reduce_sum(val_w1sq, shared_mem)
+        
+        if tid == 1
+            wi[1] = sqrt(1 + val_w1sq)
+            shared_mem[end] = 0.5 * wscale  # γi
+        end
+        sync_threads()
+        
+        γi = shared_mem[end]
+        
+        # 计算λ
+        if tid == 1
+            λi[1] = γi
+            coef = inv(si[1]/sscale + zi[1]/zscale + 2*γi)
+            c1 = ((γi + zi[1]/zscale)/sscale)
+            c2 = ((γi + si[1]/sscale)/zscale)
+            # 存储到共享内存供其他线程使用
+            shared_mem[end-3] = coef
+            shared_mem[end-2] = c1
+            shared_mem[end-1] = c2
+        end
+        sync_threads()
+        
+        coef = shared_mem[end-3]
+        c1 = shared_mem[end-2]
+        c2 = shared_mem[end-1]
+        
+        # 并行计算λ的其余元素
+        idx = tid + 1
+        while idx <= size_i
+            λi[idx] = coef * (c1 * si[idx] + c2 * zi[idx])
+            idx += blockDim().x
+        end
+        
+        sync_threads()
+        
+        # 最终缩放λ
+        scale_factor = sqrt(sscale * zscale)
+        idx = tid
+        while idx <= size_i
+            λi[idx] *= scale_factor
+            idx += blockDim().x
+        end
+    end
+    
+    return nothing
+end
+
 @inline function update_scaling_soc!(
     s::AbstractVector{T},
     z::AbstractVector{T},
@@ -265,13 +789,36 @@ end
     n_shift::Cint,
     n_soc::Cint
 ) where {T}
-
-    kernel = @cuda launch=false _kernel_update_scaling_soc!(s, z, w, λ, η, rng_cones, n_shift, n_soc)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_soc, config.threads)
-    blocks = cld(n_soc, threads)
-
-    CUDA.@sync kernel(s, z, w, λ, η, rng_cones, n_shift, n_soc; threads, blocks)
+    #=
+    if n_soc == 1
+        # 特殊优化：单个大型cone - 使用与原始版本相同的kernel，但只处理一个cone
+        # 这避免了@allowscalar的性能问题
+        kernel = @cuda launch=false _kernel_update_scaling_soc!(s, z, w, λ, η, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        # 对于单个cone，只需要一个线程块
+        threads = 1
+        blocks = 1
+        
+        CUDA.@sync kernel(s, z, w, λ, η, rng_cones, n_shift, n_soc; threads, blocks)
+    else
+    =#
+    if should_use_optimized_version(rng_cones, n_shift, n_soc)
+        # 使用优化版本（少量大型cone）
+        config = get_optimized_config(rng_cones, n_shift, n_soc)
+        shared_mem_size = sizeof(T) * config.shared_mem_size
+        
+        kernel = @cuda launch=false _kernel_update_scaling_soc_optimized!(s, z, w, λ, η, rng_cones, n_shift, n_soc)
+        CUDA.@sync kernel(s, z, w, λ, η, rng_cones, n_shift, n_soc; 
+                         threads=config.threads, blocks=n_soc, shmem=shared_mem_size)
+    else
+        # 使用原始版本
+        kernel = @cuda launch=false _kernel_update_scaling_soc!(s, z, w, λ, η, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = min(n_soc, config.threads)
+        blocks = cld(n_soc, threads)
+        
+        CUDA.@sync kernel(s, z, w, λ, η, rng_cones, n_shift, n_soc; threads, blocks)
+    end
 
 end
 
@@ -577,6 +1124,61 @@ function _kernel_mul_Hs_soc!(
     return nothing
 end
 
+# 优化版本的矩阵向量乘法
+function _kernel_mul_Hs_soc_optimized!(
+    y::AbstractVector{T},
+    x::AbstractVector{T},
+    w::AbstractVector{T},
+    η::AbstractVector{T},
+    rng_cones::AbstractVector,
+    n_linear::Cint,
+    n_soc::Cint
+) where {T}
+    cone_idx = blockIdx().x
+    tid = threadIdx().x
+    
+    shared_mem = @cuDynamicSharedMem(T, blockDim().x ÷ 32 + 1)
+    
+    if cone_idx <= n_soc
+        shift_i = cone_idx + n_linear
+        rng_cone_i = rng_cones[shift_i]
+        size_i = length(rng_cone_i)
+        @views xi = x[rng_cone_i]
+        @views yi = y[rng_cone_i]
+        @views wi = w[rng_cone_i]
+        
+        # 并行计算点积 w·x
+        val = zero(T)
+        idx = tid
+        while idx <= size_i
+            val += wi[idx] * xi[idx]
+            idx += blockDim().x
+        end
+        val = block_reduce_sum(val, shared_mem)
+        
+        if tid == 1
+            shared_mem[end] = 2 * val
+        end
+        sync_threads()
+        
+        c = shared_mem[end]
+        eta_sq = η[cone_idx]^2
+        
+        # 并行计算输出
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                yi[idx] = eta_sq * (-xi[idx] + c * wi[idx])
+            else
+                yi[idx] = eta_sq * (xi[idx] + c * wi[idx])
+            end
+            idx += blockDim().x
+        end
+    end
+    
+    return nothing
+end
+
 @inline function mul_Hs_soc!(
     y::AbstractVector{T},
     x::AbstractVector{T},
@@ -586,13 +1188,31 @@ end
     n_shift::Cint,
     n_soc::Cint
 ) where {T}
-
-    kernel = @cuda launch=false _kernel_mul_Hs_soc!(y, x, w, η, rng_cones, n_shift, n_soc)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_soc, config.threads)
-    blocks = cld(n_soc, threads)
-
-    CUDA.@sync kernel(y, x, w, η, rng_cones, n_shift, n_soc; threads, blocks)
+    if n_soc == 1
+        # 特殊优化：单个大型cone - 使用原始kernel
+        kernel = @cuda launch=false _kernel_mul_Hs_soc!(y, x, w, η, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = 1
+        blocks = 1
+        
+        CUDA.@sync kernel(y, x, w, η, rng_cones, n_shift, n_soc; threads, blocks)
+    elseif should_use_optimized_version(rng_cones, n_shift, n_soc)
+        # 使用优化版本（少量大型cone）
+        config = get_optimized_config(rng_cones, n_shift, n_soc)
+        shared_mem_size = sizeof(T) * (config.threads ÷ 32 + 1)
+        
+        kernel = @cuda launch=false _kernel_mul_Hs_soc_optimized!(y, x, w, η, rng_cones, n_shift, n_soc)
+        CUDA.@sync kernel(y, x, w, η, rng_cones, n_shift, n_soc; 
+                         threads=config.threads, blocks=n_soc, shmem=shared_mem_size)
+    else
+        # 使用原始版本
+        kernel = @cuda launch=false _kernel_mul_Hs_soc!(y, x, w, η, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = min(n_soc, config.threads)
+        blocks = cld(n_soc, threads)
+        
+        CUDA.@sync kernel(y, x, w, η, rng_cones, n_shift, n_soc; threads, blocks)
+    end
 end
 
 @inline function mul_Hs_dense_soc!(
@@ -652,6 +1272,54 @@ function _kernel_affine_ds_soc!(
 
 end
 
+# 优化版本的仿射变换
+function _kernel_affine_ds_soc_optimized!(
+    ds::AbstractVector{T},
+    λ::AbstractVector{T},
+    rng_cones::AbstractVector,
+    n_linear::Cint,
+    n_soc::Cint
+) where {T}
+    cone_idx = blockIdx().x
+    tid = threadIdx().x
+    
+    shared_mem = @cuDynamicSharedMem(T, blockDim().x ÷ 32 + 1)
+    
+    if cone_idx <= n_soc
+        shift_i = cone_idx + n_linear
+        rng_cone_i = rng_cones[shift_i]
+        size_i = length(rng_cone_i)
+        @views dsi = ds[rng_cone_i]
+        @views λi = λ[rng_cone_i]
+        
+        # 并行计算 λ·λ
+        val = zero(T)
+        idx = tid
+        while idx <= size_i
+            val += λi[idx] * λi[idx]
+            idx += blockDim().x
+        end
+        val = block_reduce_sum(val, shared_mem)
+        
+        if tid == 1
+            dsi[1] = val
+            shared_mem[end] = λi[1]
+        end
+        sync_threads()
+        
+        λi0 = shared_mem[end]
+        
+        # 并行计算其余元素
+        idx = tid + 1
+        while idx <= size_i
+            dsi[idx] = 2 * λi0 * λi[idx]
+            idx += blockDim().x
+        end
+    end
+    
+    return nothing
+end
+
 @inline function affine_ds_soc!(
     ds::AbstractVector{T},
     λ::AbstractVector{T},
@@ -659,13 +1327,349 @@ end
     n_shift::Cint,
     n_soc::Cint
 ) where {T}
+    if n_soc == 1
+        # 特殊优化：单个大型cone - 使用原始kernel
+        kernel = @cuda launch=false _kernel_affine_ds_soc!(ds, λ, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = 1
+        blocks = 1
+        
+        CUDA.@sync kernel(ds, λ, rng_cones, n_shift, n_soc; threads, blocks)
+    elseif should_use_optimized_version(rng_cones, n_shift, n_soc)
+        # 使用优化版本（少量大型cone）
+        config = get_optimized_config(rng_cones, n_shift, n_soc)
+        shared_mem_size = sizeof(T) * (config.threads ÷ 32 + 1)
+        
+        kernel = @cuda launch=false _kernel_affine_ds_soc_optimized!(ds, λ, rng_cones, n_shift, n_soc)
+        CUDA.@sync kernel(ds, λ, rng_cones, n_shift, n_soc; 
+                         threads=config.threads, blocks=n_soc, shmem=shared_mem_size)
+    else
+        # 使用原始版本
+        kernel = @cuda launch=false _kernel_affine_ds_soc!(ds, λ, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = min(n_soc, config.threads)
+        blocks = cld(n_soc, threads)
+        
+        CUDA.@sync kernel(ds, λ, rng_cones, n_shift, n_soc; threads, blocks)
+    end
+end
 
-    kernel = @cuda launch=false _kernel_affine_ds_soc!(ds, λ, rng_cones, n_shift, n_soc)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_soc, config.threads)
-    blocks = cld(n_soc, threads)
+# 优化版本：块内并行处理每个cone
+function _kernel_combined_ds_shift_soc_optimized!(
+    shift::AbstractVector{T},
+    step_z::AbstractVector{T},
+    step_s::AbstractVector{T},
+    w::AbstractVector{T},
+    η::AbstractVector{T},
+    rng_cones::AbstractVector,
+    n_linear::Cint,
+    n_soc::Cint,
+    σμ::T
+) where {T}
+    cone_idx = blockIdx().x
+    tid = threadIdx().x
+    
+    # 共享内存分配
+    shared_size = blockDim().x ÷ 32 + 8  # 用于规约和存储中间结果
+    shared_mem = @cuDynamicSharedMem(T, shared_size)
+    
+    if cone_idx <= n_soc
+        shift_i = cone_idx + n_linear
+        rng_cone_i = rng_cones[shift_i]
+        size_i = length(rng_cone_i)
+        @views step_zi = step_z[rng_cone_i]
+        @views step_si = step_s[rng_cone_i]
+        @views wi = w[rng_cone_i]
+        @views shifti = shift[rng_cone_i]
+        
+        # 先复制数据到shift作为临时空间
+        idx = tid
+        while idx <= size_i
+            shifti[idx] = step_zi[idx]
+            idx += blockDim().x
+        end
+        sync_threads()
+        
+        # Step 1: 计算 WΔz
+        # 计算 ζ = Σ(w[j]*tmp[j]) for j=2:end
+        val_ζ = zero(T)
+        idx = 2 + (tid - 1)
+        while idx <= size_i
+            val_ζ += wi[idx] * shifti[idx]
+            idx += blockDim().x
+        end
+        val_ζ = block_reduce_sum(val_ζ, shared_mem)
+        
+        if tid == 1
+            shared_mem[end-7] = val_ζ
+            shared_mem[end-6] = η[cone_idx]
+            shared_mem[end-5] = one(T) / (one(T) + wi[1])
+            shared_mem[end-4] = shifti[1] + val_ζ / (one(T) + wi[1])  # c for Δz
+        end
+        sync_threads()
+        
+        ζ_z = shared_mem[end-7]
+        η_val = shared_mem[end-6]
+        inv_1_plus_w1 = shared_mem[end-5]
+        c_z = shared_mem[end-4]
+        
+        # 更新 step_z
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                step_zi[idx] = η_val * (wi[1] * shifti[1] + ζ_z)
+            else
+                step_zi[idx] = η_val * (shifti[idx] + c_z * wi[idx])
+            end
+            idx += blockDim().x
+        end
+        sync_threads()
+        
+        # Step 2: 复制step_s到临时空间并计算 W⁻¹Δs
+        idx = tid
+        while idx <= size_i
+            shifti[idx] = step_si[idx]
+            idx += blockDim().x
+        end
+        sync_threads()
+        
+        # 计算 ζ = Σ(w[j]*tmp[j]) for j=2:end
+        val_ζ = zero(T)
+        idx = 2 + (tid - 1)
+        while idx <= size_i
+            val_ζ += wi[idx] * shifti[idx]
+            idx += blockDim().x
+        end
+        val_ζ = block_reduce_sum(val_ζ, shared_mem)
+        
+        if tid == 1
+            shared_mem[end-3] = val_ζ  # ζ_s
+            shared_mem[end-2] = one(T) / η_val
+            shared_mem[end-1] = -shifti[1] + val_ζ * inv_1_plus_w1  # c for Δs
+        end
+        sync_threads()
+        
+        ζ_s = shared_mem[end-3]
+        inv_η = shared_mem[end-2]
+        c_s = shared_mem[end-1]
+        
+        # 更新 step_s
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                step_si[idx] = inv_η * (wi[1] * shifti[1] - ζ_s)
+            else
+                step_si[idx] = inv_η * (shifti[idx] + c_s * wi[idx])
+            end
+            idx += blockDim().x
+        end
+        sync_threads()
+        
+        # Step 3: 计算 shift = W⁻¹Δs ∘ WΔz - σμe
+        # 先计算内积
+        val_dot = zero(T)
+        idx = tid
+        while idx <= size_i
+            val_dot += step_si[idx] * step_zi[idx]
+            idx += blockDim().x
+        end
+        val_dot = block_reduce_sum(val_dot, shared_mem)
+        
+        if tid == 1
+            shared_mem[end] = val_dot
+            shared_mem[end-7] = step_si[1]  # s0
+            shared_mem[end-6] = step_zi[1]  # z0
+        end
+        sync_threads()
+        
+        val_dot = shared_mem[end]
+        s0 = shared_mem[end-7]
+        z0 = shared_mem[end-6]
+        
+        # 最终更新shift
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                shifti[idx] = val_dot - σμ
+            else
+                shifti[idx] = s0 * step_zi[idx] + z0 * step_si[idx]
+            end
+            idx += blockDim().x
+        end
+    end
+    
+    return nothing
+end
 
-    CUDA.@sync kernel(ds, λ, rng_cones, n_shift, n_soc; threads, blocks)
+# 单个大型cone的特殊kernel（使用单块避免网格同步）
+function _kernel_combined_ds_shift_soc_single_cone!(
+    shift::AbstractVector{T},
+    step_z::AbstractVector{T},
+    step_s::AbstractVector{T},
+    w::AbstractVector{T},
+    η::T,
+    rng_cone,
+    cone_size::Cint,
+    σμ::T
+) where {T}
+    tid = Cint(threadIdx().x)
+    
+    # 共享内存
+    shared_size = cld(blockDim().x, 32) + 10
+    shared_mem = @cuDynamicSharedMem(T, shared_size)
+    
+    # Step 1: 复制step_z到shift作为临时空间
+    idx = tid
+    while idx <= cone_size
+        @inbounds shift[rng_cone.start + idx - 1] = step_z[rng_cone.start + idx - 1]
+        idx += blockDim().x
+    end
+    sync_threads()
+    
+    # 计算 ζ_z = Σ(w[j]*tmp[j]) for j=2:end
+    local_ζ = zero(T)
+    idx = tid
+    while idx <= cone_size - 1  # 从索引2开始
+        @inbounds local_ζ += w[rng_cone.start + idx] * shift[rng_cone.start + idx]
+        idx += blockDim().x
+    end
+    
+    local_ζ = block_reduce_sum(local_ζ, shared_mem)
+    
+    if tid == 1
+        shared_mem[end-9] = local_ζ  # ζ_z
+    end
+    sync_threads()
+    
+    ζ_z = shared_mem[end-9]
+    
+    # 计算系数
+    if tid == 1
+        @inbounds w1_val = w[rng_cone.start]
+        @inbounds tmp1_val = shift[rng_cone.start]
+        inv_1_plus_w1 = one(T) / (one(T) + w1_val)
+        c_z = tmp1_val + ζ_z * inv_1_plus_w1
+        shared_mem[end-6] = inv_1_plus_w1
+        shared_mem[end-5] = c_z
+        shared_mem[end-4] = η
+        shared_mem[end-3] = one(T) / η
+        shared_mem[end-2] = w1_val * tmp1_val + ζ_z  # 用于step_z[1]
+    end
+    sync_threads()
+    
+    inv_1_plus_w1 = shared_mem[end-6]
+    c_z = shared_mem[end-5]
+    η_val = shared_mem[end-4]
+    inv_η = shared_mem[end-3]
+    wz1_val = shared_mem[end-2]
+    
+    # 更新 step_z
+    idx = tid
+    while idx <= cone_size
+        if idx == 1
+            @inbounds step_z[rng_cone.start] = η_val * wz1_val
+        else
+            @inbounds tmp_val = shift[rng_cone.start + idx - 1]
+            @inbounds w_val = w[rng_cone.start + idx - 1]
+            @inbounds step_z[rng_cone.start + idx - 1] = η_val * (tmp_val + c_z * w_val)
+        end
+        idx += blockDim().x
+    end
+    sync_threads()
+    
+    # Step 2: 复制step_s到shift作为临时空间
+    idx = tid
+    while idx <= cone_size
+        @inbounds shift[rng_cone.start + idx - 1] = step_s[rng_cone.start + idx - 1]
+        idx += blockDim().x
+    end
+    sync_threads()
+    
+    # 计算 ζ_s
+    local_ζ = zero(T)
+    idx = tid
+    while idx <= cone_size - 1  # 从索引2开始
+        @inbounds local_ζ += w[rng_cone.start + idx] * shift[rng_cone.start + idx]
+        idx += blockDim().x
+    end
+    
+    local_ζ = block_reduce_sum(local_ζ, shared_mem)
+    
+    if tid == 1
+        shared_mem[end-8] = local_ζ  # ζ_s
+    end
+    sync_threads()
+    
+    ζ_s = shared_mem[end-8]
+    
+    # 计算系数
+    if tid == 1
+        @inbounds tmp1_val = shift[rng_cone.start]
+        @inbounds w1_val = w[rng_cone.start]
+        c_s = -tmp1_val + ζ_s * inv_1_plus_w1
+        shared_mem[end-1] = c_s
+        shared_mem[end] = w1_val * tmp1_val - ζ_s  # 用于step_s[1]
+    end
+    sync_threads()
+    
+    c_s = shared_mem[end-1]
+    ws1_val = shared_mem[end]
+    
+    # 更新 step_s
+    idx = tid
+    while idx <= cone_size
+        if idx == 1
+            @inbounds step_s[rng_cone.start] = inv_η * ws1_val
+        else
+            @inbounds tmp_val = shift[rng_cone.start + idx - 1]
+            @inbounds w_val = w[rng_cone.start + idx - 1]
+            @inbounds step_s[rng_cone.start + idx - 1] = inv_η * (tmp_val + c_s * w_val)
+        end
+        idx += blockDim().x
+    end
+    sync_threads()
+    
+    # Step 3: 计算内积
+    local_dot = zero(T)
+    idx = tid
+    while idx <= cone_size
+        @inbounds local_dot += step_s[rng_cone.start + idx - 1] * step_z[rng_cone.start + idx - 1]
+        idx += blockDim().x
+    end
+    
+    local_dot = block_reduce_sum(local_dot, shared_mem)
+    
+    if tid == 1
+        shared_mem[end-7] = local_dot  # val_dot
+    end
+    sync_threads()
+    
+    val_dot = shared_mem[end-7]
+    
+    # 获取s0和z0
+    if tid == 1
+        @inbounds shared_mem[end-9] = step_s[rng_cone.start]  # s0
+        @inbounds shared_mem[end-8] = step_z[rng_cone.start]  # z0
+    end
+    sync_threads()
+    
+    s0 = shared_mem[end-9]
+    z0 = shared_mem[end-8]
+    
+    # 最终更新shift
+    idx = tid
+    while idx <= cone_size
+        if idx == 1
+            @inbounds shift[rng_cone.start] = val_dot - σμ
+        else
+            @inbounds sz_val = step_z[rng_cone.start + idx - 1]
+            @inbounds ss_val = step_s[rng_cone.start + idx - 1]
+            @inbounds shift[rng_cone.start + idx - 1] = s0 * sz_val + z0 * ss_val
+        end
+        idx += blockDim().x
+    end
+    
+    return nothing
 end
 
 function _kernel_combined_ds_shift_soc!(
@@ -757,13 +1761,38 @@ end
     n_soc::Cint,
     σμ::T
 ) where {T}
+    if n_soc == 1
+        # 特殊优化：单个大型cone
+        CUDA.@allowscalar begin
+            rng_cone = rng_cones[n_shift + 1]
+            cone_size = Cint(length(rng_cone))
+            η_val = η[1]
+        end
+        
+        kernel = @cuda launch=false _kernel_combined_ds_shift_soc_single_cone!(shift, step_z, step_s, w, η_val, rng_cone, cone_size, σμ)
+        config = launch_configuration(kernel.fun)
+        threads = min(1024, config.threads)  # 使用更多线程处理大型cone
+        blocks = 1  # 单块执行
+        
+        shmem_size = (cld(threads, 32) + 10) * sizeof(T)
+        CUDA.@sync kernel(shift, step_z, step_s, w, η_val, rng_cone, cone_size, σμ; threads, blocks, shmem=shmem_size)
+    elseif should_use_optimized_version(rng_cones, n_shift, n_soc)
+        # 使用优化版本（少量大型cone）
+        config = get_optimized_config(rng_cones, n_shift, n_soc)
+        shared_mem_size = sizeof(T) * (config.threads ÷ 32 + 8)
+        
+        kernel = @cuda launch=false _kernel_combined_ds_shift_soc_optimized!(shift, step_z, step_s, w, η, rng_cones, n_shift, n_soc, σμ)
+        CUDA.@sync kernel(shift, step_z, step_s, w, η, rng_cones, n_shift, n_soc, σμ; 
+                         threads=config.threads, blocks=n_soc, shmem=shared_mem_size)
+    else
+        # 原始实现：多个cone
+        kernel = @cuda launch=false _kernel_combined_ds_shift_soc!(shift, step_z, step_s, w, η, rng_cones, n_shift, n_soc, σμ)
+        config = launch_configuration(kernel.fun)
+        threads = min(n_soc, config.threads)
+        blocks = cld(n_soc, threads)
 
-    kernel = @cuda launch=false _kernel_combined_ds_shift_soc!(shift, step_z, step_s, w, η, rng_cones, n_shift, n_soc, σμ)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_soc, config.threads)
-    blocks = cld(n_soc, threads)
-
-    CUDA.@sync kernel(shift, step_z, step_s, w, η, rng_cones, n_shift, n_soc, σμ; threads, blocks)
+        CUDA.@sync kernel(shift, step_z, step_s, w, η, rng_cones, n_shift, n_soc, σμ; threads, blocks)
+    end
 end
 
 function _kernel_Δs_from_Δz_offset_soc!(
@@ -815,6 +1844,213 @@ function _kernel_Δs_from_Δz_offset_soc!(
 
 end
 
+# 优化版本：块内并行处理每个cone
+function _kernel_Δs_from_Δz_offset_soc_optimized!(
+    out::AbstractVector{T},
+    ds::AbstractVector{T},
+    z::AbstractVector{T},
+    w::AbstractVector{T},
+    λ::AbstractVector{T},
+    η::AbstractVector{T},
+    rng_cones::AbstractVector,
+    n_shift::Cint,
+    n_soc::Cint
+) where {T}
+    cone_idx = blockIdx().x
+    tid = threadIdx().x
+    
+    # 共享内存分配：用于存储中间结果
+    shared_size = blockDim().x ÷ 32 + 5  # 额外空间存储reszi, λ1ds1, w1ds1, c, 1/λi[1]
+    shared_mem = @cuDynamicSharedMem(T, shared_size)
+    
+    if cone_idx <= n_soc
+        shift_i = cone_idx + n_shift
+        rng_cone_i = rng_cones[shift_i]
+        size_i = length(rng_cone_i)
+        @views outi = out[rng_cone_i]
+        @views dsi = ds[rng_cone_i]
+        @views zi = z[rng_cone_i]
+        @views wi = w[rng_cone_i]
+        @views λi = λ[rng_cone_i]
+        
+        # 并行计算z的residual
+        val_reszi = zero(T)
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                val_reszi += zi[idx] * zi[idx]
+            else
+                val_reszi -= zi[idx] * zi[idx]
+            end
+            idx += blockDim().x
+        end
+        val_reszi = block_reduce_sum(val_reszi, shared_mem)
+        
+        if tid == 1
+            shared_mem[end-4] = val_reszi  # reszi
+        end
+        sync_threads()
+        reszi = shared_mem[end-4]
+        
+        # 并行计算λ·ds点积（从索引2开始）
+        val_λ1ds1 = zero(T)
+        idx = 2 + (tid - 1)
+        while idx <= size_i
+            val_λ1ds1 += λi[idx] * dsi[idx]
+            idx += blockDim().x
+        end
+        val_λ1ds1 = block_reduce_sum(val_λ1ds1, shared_mem)
+        
+        if tid == 1
+            shared_mem[end-3] = val_λ1ds1  # λ1ds1
+        end
+        sync_threads()
+        λ1ds1 = shared_mem[end-3]
+        
+        # 并行计算w·ds点积（从索引2开始）
+        val_w1ds1 = zero(T)
+        idx = 2 + (tid - 1)
+        while idx <= size_i
+            val_w1ds1 += wi[idx] * dsi[idx]
+            idx += blockDim().x
+        end
+        val_w1ds1 = block_reduce_sum(val_w1ds1, shared_mem)
+        
+        if tid == 1
+            shared_mem[end-2] = val_w1ds1  # w1ds1
+            shared_mem[end-1] = (λi[1] * dsi[1] - λ1ds1) / reszi  # c
+            shared_mem[end] = one(T) / λi[1]  # 1/λi[1]
+        end
+        sync_threads()
+        
+        w1ds1 = shared_mem[end-2]
+        c = shared_mem[end-1]
+        inv_λi1 = shared_mem[end]
+        
+        # 并行计算输出向量
+        idx = tid
+        while idx <= size_i
+            if idx == 1
+                outi[idx] = (zi[idx] * c + η[cone_idx] * w1ds1) * inv_λi1
+            else
+                outi[idx] = (-zi[idx] * c + η[cone_idx] * (dsi[idx] + w1ds1/(1+wi[1])*wi[idx])) * inv_λi1
+            end
+            idx += blockDim().x
+        end
+    end
+    
+    return nothing
+end
+
+# 单个大型cone的特殊kernel（使用单块避免网格同步）
+function _kernel_Δs_from_Δz_offset_soc_single_cone!(
+    out::AbstractVector{T},
+    ds::AbstractVector{T},
+    z::AbstractVector{T},
+    w::AbstractVector{T},
+    λ::AbstractVector{T},
+    η::T,
+    rng_cone,
+    cone_size::Cint
+) where {T}
+    tid = Cint(threadIdx().x)
+    
+    # 共享内存用于规约和存储结果
+    shared_size = cld(blockDim().x, 32) + 10
+    shared_mem = @cuDynamicSharedMem(T, shared_size)
+    
+    # Step 1: 计算z的residual
+    local_reszi = zero(T)
+    idx = tid
+    while idx <= cone_size
+        @inbounds val = z[rng_cone.start + idx - 1]
+        if idx == 1
+            local_reszi += val * val
+        else
+            local_reszi -= val * val
+        end
+        idx += blockDim().x
+    end
+    
+    # 块内规约
+    local_reszi = block_reduce_sum(local_reszi, shared_mem)
+    
+    if tid == 1
+        shared_mem[end-4] = local_reszi  # reszi
+    end
+    sync_threads()
+    
+    reszi = shared_mem[end-4]
+    
+    # Step 2: 计算λ·ds点积（从索引2开始）
+    local_λ1ds1 = zero(T)
+    idx = tid
+    while idx <= cone_size - 1  # 从索引2开始
+        @inbounds local_λ1ds1 += λ[rng_cone.start + idx] * ds[rng_cone.start + idx]
+        idx += blockDim().x
+    end
+    
+    local_λ1ds1 = block_reduce_sum(local_λ1ds1, shared_mem)
+    
+    if tid == 1
+        shared_mem[end-3] = local_λ1ds1  # λ1ds1
+    end
+    sync_threads()
+    
+    λ1ds1 = shared_mem[end-3]
+    
+    # Step 3: 计算w·ds点积（从索引2开始）
+    local_w1ds1 = zero(T)
+    idx = tid
+    while idx <= cone_size - 1  # 从索引2开始
+        @inbounds local_w1ds1 += w[rng_cone.start + idx] * ds[rng_cone.start + idx]
+        idx += blockDim().x
+    end
+    
+    local_w1ds1 = block_reduce_sum(local_w1ds1, shared_mem)
+    
+    if tid == 1
+        shared_mem[end-2] = local_w1ds1  # w1ds1
+    end
+    sync_threads()
+    
+    w1ds1 = shared_mem[end-2]
+    
+    # 计算系数
+    if tid == 1
+        @inbounds λ1_val = λ[rng_cone.start]
+        @inbounds ds1_val = ds[rng_cone.start]
+        @inbounds w1_val = w[rng_cone.start]
+        c = (λ1_val * ds1_val - λ1ds1) / reszi
+        inv_λ1 = one(T) / λ1_val
+        shared_mem[end-1] = c
+        shared_mem[end] = inv_λ1
+        shared_mem[end-5] = one(T) / (one(T) + w1_val)  # 1/(1+w[1])
+    end
+    sync_threads()
+    
+    c = shared_mem[end-1]
+    inv_λ1 = shared_mem[end]
+    inv_1_plus_w1 = shared_mem[end-5]
+    
+    # Step 4: 并行计算输出向量
+    idx = tid
+    while idx <= cone_size
+        if idx == 1
+            @inbounds z1_val = z[rng_cone.start]
+            @inbounds out[rng_cone.start] = (z1_val * c + η * w1ds1) * inv_λ1
+        else
+            @inbounds zi_val = z[rng_cone.start + idx - 1]
+            @inbounds dsi_val = ds[rng_cone.start + idx - 1]
+            @inbounds wi_val = w[rng_cone.start + idx - 1]
+            @inbounds out[rng_cone.start + idx - 1] = (-zi_val * c + η * (dsi_val + w1ds1 * inv_1_plus_w1 * wi_val)) * inv_λ1
+        end
+        idx += blockDim().x
+    end
+    
+    return nothing
+end
+
 @inline function Δs_from_Δz_offset_soc!(
     out::AbstractVector{T},
     ds::AbstractVector{T},
@@ -826,13 +2062,38 @@ end
     n_shift::Cint,
     n_soc::Cint
 ) where {T}
+    if n_soc == 1
+        # 特殊优化：单个大型cone
+        CUDA.@allowscalar begin
+            rng_cone = rng_cones[n_shift + 1]
+            cone_size = Cint(length(rng_cone))
+            η_val = η[1]
+        end
+        
+        kernel = @cuda launch=false _kernel_Δs_from_Δz_offset_soc_single_cone!(out, ds, z, w, λ, η_val, rng_cone, cone_size)
+        config = launch_configuration(kernel.fun)
+        threads = min(1024, config.threads)  # 使用更多线程处理大型cone
+        blocks = 1  # 单块执行
+        
+        shmem_size = (cld(threads, 32) + 10) * sizeof(T)
+        CUDA.@sync kernel(out, ds, z, w, λ, η_val, rng_cone, cone_size; threads, blocks, shmem=shmem_size)
+    elseif should_use_optimized_version(rng_cones, n_shift, n_soc)
+        # 使用优化版本（少量大型cone）
+        config = get_optimized_config(rng_cones, n_shift, n_soc)
+        shared_mem_size = sizeof(T) * (config.threads ÷ 32 + 5)
+        
+        kernel = @cuda launch=false _kernel_Δs_from_Δz_offset_soc_optimized!(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc)
+        CUDA.@sync kernel(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc; 
+                         threads=config.threads, blocks=n_soc, shmem=shared_mem_size)
+    else
+        # 使用原始版本
+        kernel = @cuda launch=false _kernel_Δs_from_Δz_offset_soc!(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc)
+        config = launch_configuration(kernel.fun)
+        threads = min(n_soc, config.threads)
+        blocks = cld(n_soc, threads)
 
-    kernel = @cuda launch=false _kernel_Δs_from_Δz_offset_soc!(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_soc, config.threads)
-    blocks = cld(n_soc, threads)
-
-    CUDA.@sync kernel(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc; threads, blocks)
+        CUDA.@sync kernel(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc; threads, blocks)
+    end
 end
 
 #return maximum allowable step length while remaining in the socone
@@ -1050,6 +2311,33 @@ end
     res = res > 0.0 ? sqrt(res) : zero(T)
 end 
 
+# compute the residual at z + α*dz without storing the intermediate vector
+@inline function _soc_residual_shifted(
+    z::AbstractVector{T}, 
+    dz::AbstractVector{T}, 
+    α::T
+) where {T} 
+    
+    x0 = z[1] + α * dz[1]
+    # compute dot product of shifted vector
+    x1sq = zero(T)
+    @inbounds for j in 2:length(z)
+        xj = z[j] + α * dz[j]
+        x1sq += xj * xj
+    end
+    x1norm = sqrt(x1sq)
+    res = (x0 - x1norm) * (x0 + x1norm)
+    return res
+end 
+
+@inline function logsafe(v::T) where {T<:Real}
+    if v < 0
+        return -typemax(T)
+    else 
+        return log(v)
+    end
+end
+
 @inline function _dot_xy_gpu(x::AbstractVector{T},y::AbstractVector{T},rng::UnitRange) where {T} 
     val = zero(T)
     @inbounds for j in rng
@@ -1141,3 +2429,5 @@ end
     return min(αmax,r1,r2)
 
 end
+
+# End of SOC GPU operations
