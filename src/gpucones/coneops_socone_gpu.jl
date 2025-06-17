@@ -1018,8 +1018,9 @@ end
 
 @inline function get_Hs_soc_sparse_sequential!(
     Hsblocks::AbstractVector{T},
-    η::AbstractVector{T},
+    η::AbstractVector,
     d::AbstractVector{T},
+    vut::AbstractVector{T},
     rng_blocks::AbstractVector,
     n_shift::Cint,
     n_sparse_soc::Cint
@@ -1463,6 +1464,7 @@ function _kernel_combined_ds_shift_soc_optimized!(
             end
             idx += blockDim().x
         end
+        
         sync_threads()
         
         # Step 3: 计算 shift = W⁻¹Δs ∘ WΔz - σμe
@@ -1698,7 +1700,7 @@ function _kernel_combined_ds_shift_soc!(
         #shift vector used as workspace for a few steps 
         tmp = shifti            
 
-        #Δz <- WΔz
+        #Δz<- WΔz
         @inbounds for j in 1:size_i
             tmp[j] = step_zi[j]
         end         
@@ -1710,8 +1712,7 @@ function _kernel_combined_ds_shift_soc!(
 
         c = tmp[1] + ζ/(1+wi[1])
       
-        step_zi[1] = η[i]*(wi[1]*tmp[1] + ζ)
-      
+        step_zi[1] = η[i]*(wi[1]*tmp[1] + ζ)      
         @inbounds for j in 2:size_i
             step_zi[j] = η[i]*(tmp[j] + c*wi[j]) 
         end      
@@ -1755,7 +1756,7 @@ end
     step_z::AbstractVector{T},
     step_s::AbstractVector{T},
     w::AbstractVector{T},
-    η::AbstractVector{T},
+    η::AbstractVector,
     rng_cones::AbstractVector,
     n_shift::Cint,
     n_soc::Cint,
@@ -1841,7 +1842,6 @@ function _kernel_Δs_from_Δz_offset_soc!(
     end
 
     return nothing
-
 end
 
 # 优化版本：块内并行处理每个cone
@@ -1860,7 +1860,7 @@ function _kernel_Δs_from_Δz_offset_soc_optimized!(
     tid = threadIdx().x
     
     # 共享内存分配：用于存储中间结果
-    shared_size = blockDim().x ÷ 32 + 5  # 额外空间存储reszi, λ1ds1, w1ds1, c, 1/λi[1]
+    shared_size = blockDim().x ÷ 32 + 6  # 额外空间存储reszi, λ1ds1, w1ds1, c, 1/λi[1], inv_1_plus_w1
     shared_mem = @cuDynamicSharedMem(T, shared_size)
     
     if cone_idx <= n_soc
@@ -1917,15 +1917,17 @@ function _kernel_Δs_from_Δz_offset_soc_optimized!(
         val_w1ds1 = block_reduce_sum(val_w1ds1, shared_mem)
         
         if tid == 1
-            shared_mem[end-2] = val_w1ds1  # w1ds1
-            shared_mem[end-1] = (λi[1] * dsi[1] - λ1ds1) / reszi  # c
-            shared_mem[end] = one(T) / λi[1]  # 1/λi[1]
+            shared_mem[end-3] = val_w1ds1  # w1ds1
+            shared_mem[end-2] = (λi[1] * dsi[1] - λ1ds1) / reszi  # c
+            shared_mem[end-1] = one(T) / λi[1]  # 1/λi[1]
+            shared_mem[end] = one(T) / (one(T) + wi[1])  # inv_1_plus_w1
         end
         sync_threads()
         
-        w1ds1 = shared_mem[end-2]
-        c = shared_mem[end-1]
-        inv_λi1 = shared_mem[end]
+        w1ds1 = shared_mem[end-3]
+        c = shared_mem[end-2]
+        inv_λi1 = shared_mem[end-1]
+        inv_1_plus_w1 = shared_mem[end]
         
         # 并行计算输出向量
         idx = tid
@@ -1933,7 +1935,7 @@ function _kernel_Δs_from_Δz_offset_soc_optimized!(
             if idx == 1
                 outi[idx] = (zi[idx] * c + η[cone_idx] * w1ds1) * inv_λi1
             else
-                outi[idx] = (-zi[idx] * c + η[cone_idx] * (dsi[idx] + w1ds1/(1+wi[1])*wi[idx])) * inv_λi1
+                outi[idx] = (-zi[idx] * c + η[cone_idx] * (dsi[idx] + w1ds1 * inv_1_plus_w1 * wi[idx])) * inv_λi1
             end
             idx += blockDim().x
         end
@@ -2080,7 +2082,7 @@ end
     elseif should_use_optimized_version(rng_cones, n_shift, n_soc)
         # 使用优化版本（少量大型cone）
         config = get_optimized_config(rng_cones, n_shift, n_soc)
-        shared_mem_size = sizeof(T) * (config.threads ÷ 32 + 5)
+        shared_mem_size = sizeof(T) * (config.threads ÷ 32 + 6)
         
         kernel = @cuda launch=false _kernel_Δs_from_Δz_offset_soc_optimized!(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc)
         CUDA.@sync kernel(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc; 
@@ -2170,11 +2172,11 @@ function _kernel_compute_barrier_soc(
         @views dsi = ds[rng_cone_i] 
         @views zi = z[rng_cone_i] 
         @views dzi = dz[rng_cone_i]  
-        res_si = _soc_residual_shifted(si,dsi,α)
-        res_zi = _soc_residual_shifted(zi,dzi,α)
+        res_si = _soc_residual_shifted_gpu(si,dsi,α)
+        res_zi = _soc_residual_shifted_gpu(zi,dzi,α)
 
         # avoid numerical issue if res_s <= 0 or res_z <= 0
-        barrier[i] = (res_si > 0 && res_zi > 0) ? -logsafe(res_si*res_zi)/2 : Inf
+        barrier[i] = (res_si > 0 && res_zi > 0) ? -logsafe_gpu(res_si*res_zi)/2 : Inf
     end
 
     return nothing
@@ -2312,7 +2314,7 @@ end
 end 
 
 # compute the residual at z + α*dz without storing the intermediate vector
-@inline function _soc_residual_shifted(
+@inline function _soc_residual_shifted_gpu(
     z::AbstractVector{T}, 
     dz::AbstractVector{T}, 
     α::T
@@ -2330,7 +2332,7 @@ end
     return res
 end 
 
-@inline function logsafe(v::T) where {T<:Real}
+@inline function logsafe_gpu(v::T) where {T<:Real}
     if v < 0
         return -typemax(T)
     else 
