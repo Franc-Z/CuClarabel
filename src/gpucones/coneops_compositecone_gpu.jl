@@ -1,4 +1,3 @@
-
 degree(cones::CompositeConeGPU{T}) where {T} = cones.degree
 numel(cones::CompositeConeGPU{T}) where {T}  = cones.numel
 
@@ -263,6 +262,7 @@ function get_Hs!(
     #sparse SOCs
     n_sparse_soc = cones.n_sparse_soc
     d = cones.d
+    vut = cones.vut
 
     get_Hs_zero!(Hsblocks, rng_blocks, idx_eq)
 
@@ -273,7 +273,7 @@ function get_Hs!(
         if n_sparse_soc > SPARSE_SOC_PARALELL_NUM
             get_Hs_soc_sparse_parallel!(Hsblocks, η, d, rng_blocks, n_shift, n_sparse_soc)
         elseif n_sparse_soc > 0
-            get_Hs_soc_sparse_sequential!(Hsblocks, η, d, rng_blocks, n_shift, n_sparse_soc)
+            get_Hs_soc_sparse_sequential!(Hsblocks, η, d, vut, rng_blocks, n_shift, n_sparse_soc)
         end
         n_dense_soc = n_soc - n_sparse_soc
         if n_dense_soc > 0 
