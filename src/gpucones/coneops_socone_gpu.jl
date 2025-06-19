@@ -2332,14 +2332,6 @@ end
     return res
 end 
 
-@inline function logsafe_gpu(v::T) where {T<:Real}
-    if v < 0
-        return -typemax(T)
-    else 
-        return log(v)
-    end
-end
-
 @inline function _dot_xy_gpu(x::AbstractVector{T},y::AbstractVector{T},rng::UnitRange) where {T} 
     val = zero(T)
     @inbounds for j in rng
