@@ -25,13 +25,15 @@
 ) where{T}
     margin = zero(T)
     
-    CUDA.@allowscalar @inbounds for i in idx_inq
+    CUDA.@allowscalar for i in idx_inq
         rng_cone_i = rng_cones[i]
         @views zi = z[rng_cone_i]
-        αmin = min(αmin,minimum(zi))
+        # Use GPU reduction for minimum
+        αmin = min(αmin, minimum(zi))
         @views αi = α[rng_cone_i]
-        @. αi = max(zi,zero(T))
-        CUDA.synchronize()
+        # Use GPU broadcast
+        @. αi = max(zi, zero(T))
+        # Use GPU reduction for sum
         margin += sum(αi)
     end
 
@@ -46,13 +48,10 @@ end
     α::T
 ) where{T}
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            rng_cone_i = rng_cones[i]
-            @views @. z[rng_cone_i] += α 
-        end
+    CUDA.@allowscalar for i in idx_inq
+        rng_cone_i = rng_cones[i]
+        @views @. z[rng_cone_i] += α 
     end
-    CUDA.synchronize()
 end
 
 # unit initialization for asymmetric solves
@@ -63,14 +62,11 @@ end
    idx_inq::Vector{Cint}
 ) where{T}
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            rng_cone_i = rng_cones[i]
-            @views @. z[rng_cone_i] = one(T)
-            @views @. s[rng_cone_i] = one(T)
-        end
+    CUDA.@allowscalar for i in idx_inq
+        rng_cone_i = rng_cones[i]
+        @views @. z[rng_cone_i] = one(T)
+        @views @. s[rng_cone_i] = one(T)
     end
-    CUDA.synchronize()
 end
 
 #configure cone internals to provide W = I scaling
@@ -80,12 +76,9 @@ end
     idx_inq::Vector{Cint}
 ) where {T}
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views @. w[rng_cones[i]] = one(T)
-        end
+    CUDA.@allowscalar for i in idx_inq
+        @views @. w[rng_cones[i]] = one(T)
     end
-    CUDA.synchronize()
 end
 
 @inline function update_scaling_nonnegative!(
@@ -99,12 +92,14 @@ end
 
     CUDA.@allowscalar for i in idx_inq
         rng_cone_i = rng_cones[i]
-        @views  si = s[rng_cone_i]
-        @views  zi = z[rng_cone_i]
-        @views  @. λ[rng_cone_i] = sqrt(si*zi)
-        @views  @. w[rng_cone_i] = sqrt(si/zi)
+        @views si = s[rng_cone_i]
+        @views zi = z[rng_cone_i]
+        @views λi = λ[rng_cone_i]
+        @views wi = w[rng_cone_i]
+        # Use GPU broadcast operations
+        @. λi = sqrt(si * zi)
+        @. wi = sqrt(si / zi)
     end
-    CUDA.synchronize()
 end
 
 @inline function get_Hs_nonnegative!(
@@ -117,13 +112,10 @@ end
 
     #this block is diagonal, and we expect here
     #to receive only the diagonal elements to fill
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views wi = w[rng_cones[i]]
-            @views @. Hsblocks[rng_blocks[i]] = wi^2
-        end
+    CUDA.@allowscalar for i in idx_inq
+        @views wi = w[rng_cones[i]]
+        @views @. Hsblocks[rng_blocks[i]] = wi^2
     end
-    CUDA.synchronize()
 end
 
 # compute the product y = WᵀWx
@@ -136,15 +128,12 @@ end
 ) where {T}
 
     #NB : seemingly sensitive to order of multiplication
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views wi = w[rng_cones[i]]
-            @views xi = x[rng_cones[i]]
-            @views yi = y[rng_cones[i]]
-            @. yi = (wi * (wi * xi))
-        end
+    CUDA.@allowscalar for i in idx_inq
+        @views wi = w[rng_cones[i]]
+        @views xi = x[rng_cones[i]]
+        @views yi = y[rng_cones[i]]
+        @. yi = wi * (wi * xi)
     end
-    CUDA.synchronize()
 end
 
 # returns ds = λ∘λ for the nn cone
@@ -155,12 +144,9 @@ end
     idx_inq::Vector{Cint} 
 ) where {T}
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views @. ds[rng_cones[i]] = λ[rng_cones[i]]^2
-        end
+    CUDA.@allowscalar for i in idx_inq
+        @views @. ds[rng_cones[i]] = λ[rng_cones[i]]^2
     end
-    CUDA.synchronize()
 end
 
 @inline function combined_ds_shift_nonnegative!(
@@ -176,33 +162,22 @@ end
     # The shift must be assembled carefully if we want to be economical with
     # allocated memory.  Will modify the step.z and step.s in place since
     # they are from the affine step and not needed anymore.
-    #
-    # We can't have aliasing vector arguments to gemv_W or gemv_Winv, so 
-    # we need a temporary variable to assign #Δz <= WΔz and Δs <= W⁻¹Δs
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views shift_i = shift[rng_cones[i]]
-            step_zi = step_z[rng_cones[i]]
-            step_si = step_s[rng_cones[i]]
-            wi = w[rng_cones[i]]
+    CUDA.@allowscalar for i in idx_inq
+        rng = rng_cones[i]
+        @views shift_i = shift[rng]
+        @views step_zi = step_z[rng]
+        @views step_si = step_s[rng]
+        @views wi = w[rng]
 
-            #shift vector used as workspace for a few steps 
-            tmp = shift_i              
-
-                #Δz <- WΔz
-            @. tmp = step_zi           
-            @. step_zi = tmp*wi
-
-            #Δs <- W⁻¹Δs
-            @. tmp = step_si           
-            @. step_si = tmp/wi
-
-            #shift = W⁻¹Δs ∘ WΔz - σμe
-            @. shift_i = step_si*step_zi - σμ    
-        end
-    end    
-    CUDA.synchronize()               
+        # Use element-wise operations
+        # Δz <- WΔz
+        @. step_zi *= wi
+        # Δs <- W⁻¹Δs
+        @. step_si /= wi
+        # shift = W⁻¹Δs ∘ WΔz - σμe
+        @. shift_i = step_si * step_zi - σμ    
+    end
 end
 
 @inline function Δs_from_Δz_offset_nonnegative!(
@@ -212,12 +187,9 @@ end
     rng_cones::AbstractVector,
     idx_inq::Vector{Cint} 
 ) where {T}
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            @views @. out[rng_cones[i]] = ds[rng_cones[i]] / z[rng_cones[i]]
-        end
+    CUDA.@allowscalar for i in idx_inq
+        @views @. out[rng_cones[i]] = ds[rng_cones[i]] / z[rng_cones[i]]
     end
-    CUDA.synchronize()
 end
 
 #return maximum allowable step length while remaining in the nn cone
@@ -230,7 +202,6 @@ function _kernel_step_length_nonnegative(
      len_rng::Cint,
      αmax::T
 ) where {T}
-
 
     i = (blockIdx().x-1)*blockDim().x+threadIdx().x
     if i <= len_rng
@@ -253,23 +224,29 @@ end
      idx_inq::Vector{Cint} 
 ) where {T}
 
-    CUDA.@allowscalar begin
-        for i in idx_inq
-            len_nn = Cint(length(rng_cones[i]))
-            rng_cone_i = rng_cones[i]
-            @views dzi = dz[rng_cone_i]
-            @views dsi = ds[rng_cone_i]
-            @views zi = z[rng_cone_i]
-            @views si = s[rng_cone_i]
-            @views αi = α[rng_cone_i]
-            
+    CUDA.@allowscalar for i in idx_inq
+        len_nn = Cint(length(rng_cones[i]))
+        rng_cone_i = rng_cones[i]
+        @views dzi = dz[rng_cone_i]
+        @views dsi = ds[rng_cone_i]
+        @views zi = z[rng_cone_i]
+        @views si = s[rng_cone_i]
+        @views αi = α[rng_cone_i]
+        
+        # Only use kernel for large cones
+        if len_nn > 256  # threshold for kernel launch
             kernel = @cuda launch=false _kernel_step_length_nonnegative(dzi, dsi, zi, si, αi, len_nn, αmax)
             config = launch_configuration(kernel.fun)
             threads = min(len_nn, config.threads)
             blocks = cld(len_nn, threads)
         
             CUDA.@sync kernel(dzi, dsi, zi, si, αi, len_nn, αmax; threads, blocks)
-            αmax = min(αmax,minimum(αi))
+            αmax = min(αmax, minimum(αi))
+        else
+            # For small cones, use direct computation with GPU operations
+            @. αi = ifelse(dzi < 0, min(αmax, -zi/dzi), αmax)
+            @. αi = ifelse(dsi < 0, min(αi, -si/dsi), αi)
+            αmax = min(αmax, minimum(αi))
         end
     end
 
@@ -288,7 +265,8 @@ function _kernel_compute_barrier_nonnegative(
 
     i = (blockIdx().x-1)*blockDim().x+threadIdx().x
     if i <= len_nn
-        barrier[i] = -logsafe((s[i] + α*ds[i])*(z[i] + α*dz[i]))
+        sz_new = (s[i] + α*ds[i])*(z[i] + α*dz[i])
+        barrier[i] = -logsafe_gpu(sz_new)
     end
 
     return nothing
@@ -309,10 +287,28 @@ end
     barrier = zero(T)
     CUDA.@allowscalar for i in idx_inq
         rng_cone_i = rng_cones[i]
-        @views worki = work[rng_cone_i]
-        @views @. worki = -logsafe((s[rng_cone_i] + α*ds[rng_cone_i])*(z[rng_cone_i] + α*dz[rng_cone_i]))
-        CUDA.synchronize()
-        barrier += sum(worki)
+        len_cone = length(rng_cone_i)
+        
+        if len_cone > 256  # threshold for kernel launch
+            @views worki = work[rng_cone_i]
+            @views zi = z[rng_cone_i]
+            @views si = s[rng_cone_i]
+            @views dzi = dz[rng_cone_i]
+            @views dsi = ds[rng_cone_i]
+            
+            kernel = @cuda launch=false _kernel_compute_barrier_nonnegative(worki, zi, si, dzi, dsi, α, Cint(len_cone))
+            config = launch_configuration(kernel.fun)
+            threads = min(len_cone, config.threads)
+            blocks = cld(len_cone, threads)
+            
+            CUDA.@sync kernel(worki, zi, si, dzi, dsi, α, Cint(len_cone); threads, blocks)
+            barrier += sum(worki)
+        else
+            # For small cones, use direct GPU operations
+            @views worki = work[rng_cone_i]
+            @views @. worki = -logsafe_gpu((s[rng_cone_i] + α*ds[rng_cone_i])*(z[rng_cone_i] + α*dz[rng_cone_i]))
+            barrier += sum(worki)
+        end
     end
 
     return barrier
