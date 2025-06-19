@@ -429,3 +429,11 @@ function isequal_sparsity(A::CuSparseMatrix, B::CuSparseMatrix)
         isequal(A.rowPtr, B.rowPtr) &&
         isequal(A.colVal, B.colVal)
 end
+
+@inline function logsafe_gpu(v::T) where {T<:Real}
+    if v < 0
+        return -typemax(T)
+    else 
+        return log(v)
+    end
+end
