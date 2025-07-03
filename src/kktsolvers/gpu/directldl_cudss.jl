@@ -45,7 +45,7 @@ function refactor!(ldlsolver::CUDSSDirectLDLSolver{T}) where{T}
     cudss_set(ldlsolver.cudssSolver.matrix,ldlsolver.KKT)
 
     # Refactorization
-    cudss("factorization", ldlsolver.cudssSolver, ldlsolver.x, ldlsolver.b)
+    cudss("refactorization", ldlsolver.cudssSolver, ldlsolver.x, ldlsolver.b)
 
     # YC: should be corrected later on 
     return true
