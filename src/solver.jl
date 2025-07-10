@@ -249,7 +249,8 @@ end
 Computes the solution to the problem in a `Clarabel.Solver` previously defined in [`setup!`](@ref).
 """
 function solve!(
-    s::Solver{T}
+    s::Solver{T}, 
+    warm_start::Bool = false
 ) where{T}
 
     # initialization needed for first loop pass 
@@ -271,7 +272,25 @@ function solve!(
     @timeit s.timers "solve!" begin
 	    
         # initialize variables to some reasonable starting point
-        @timeit s.timers "default start" solver_default_start!(s)
+        if warm_start
+            # get variables from last solving   
+            s.variables.x .= s.prev_vars.x
+            s.variables.z .= s.prev_vars.z
+            s.variables.s .= s.prev_vars.s 
+            s.variables.τ = s.prev_vars.τ
+            s.variables.κ = s.prev_vars.κ
+            
+            # updating KKT system 
+	    #kkt_solve_initial_point!(s.kktsystem,s.variables,s.data)
+            kkt_update!(s.kktsystem, s.data, s.cones)  
+                        
+            # shift variables into feasible domains  
+            _shift_to_cone_interior!(s.variables.s, s.cones, PrimalCone)  
+            _shift_to_cone_interior!(s.variables.z, s.cones, DualCone)  
+            
+        else
+            @timeit s.timers "default start" solver_default_start!(s)
+        end
 
         @timeit s.timers "IP iteration" begin
 
