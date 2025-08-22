@@ -142,9 +142,9 @@ end
 function setup!(
     s::Solver{T},
     P::AbstractMatrix{T},
-    q::Vector{T},
+    q::AbstractVector{T},
     A::AbstractMatrix{T},
-    b::Vector{T},
+    b::AbstractVector{T},
     cones::Vector{<:SupportedCone}; 
     kwargs...
 ) where{T <: AbstractFloat}
