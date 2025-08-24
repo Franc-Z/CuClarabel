@@ -18,7 +18,7 @@ function allows_primal_dual_scaling(cones::CompositeConeGPU{T}) where {T}
 end
 
 
-function rectify_equilibration!(
+NVTX.@annotate "rectify_equilibration!" function rectify_equilibration!(
     cones::CompositeConeGPU{T},
      δ::CuVector{T},
      e::CuVector{T}
@@ -39,7 +39,7 @@ function rectify_equilibration!(
     return any_changed
 end
 
-function margins(
+NVTX.@annotate "margins" function margins(
     cones::CompositeConeGPU{T},
     z::CuVector{T},
     pd::PrimalOrDualCone,
@@ -78,7 +78,7 @@ function margins(
     return (αmin,β)
 end
 
-function scaled_unit_shift!(
+NVTX.@annotate "scaled_unit_shift" function scaled_unit_shift!(
     cones::CompositeConeGPU{T},
     z::CuVector{T},
     α::T,
@@ -112,7 +112,7 @@ function scaled_unit_shift!(
 end
 
 # unit initialization for asymmetric solves
-function unit_initialization!(
+NVTX.@annotate "unit_initialization" function unit_initialization!(
     cones::CompositeConeGPU{T},
     z::CuVector{T},
     s::CuVector{T}
@@ -158,7 +158,7 @@ function unit_initialization!(
 
 end
 
-function set_identity_scaling!(
+NVTX.@annotate "set_identity_scaling!" function set_identity_scaling!(
     cones::CompositeConeGPU{T}
 ) where {T}
 
@@ -182,7 +182,7 @@ function set_identity_scaling!(
     return nothing
 end
 
-function update_scaling!(
+NVTX.@annotate "update_scaling!" function update_scaling!(
     cones::CompositeConeGPU{T},
     s::CuVector{T},
     z::CuVector{T},
@@ -209,17 +209,21 @@ function update_scaling!(
     d = cones.d
     vut = cones.vut
     numel_linear = cones.numel_linear
-    
-    update_scaling_nonnegative!(s, z, w, λ, rng_cones, idx_inq)
+
+    NVTX.@range "Nonnegative" begin
+        update_scaling_nonnegative!(s, z, w, λ, rng_cones, idx_inq)
+    end
 
     n_shift = n_linear
 
-    if n_sparse_soc > 0 && n_sparse_soc <= SPARSE_SOC_PARALELL_NUM
-        update_scaling_soc_parallel_medium!(s, z, w, λ, η, 
-                                            cones.worksoc1, cones.worksoc2, cones.worksoc3, 
-                                            rng_cones, n_shift, n_sparse_soc)
-        n_shift += n_sparse_soc
-        n_soc -= n_sparse_soc
+    NVTX.@range "soc medium" begin
+        if n_sparse_soc > 0 && n_sparse_soc <= SPARSE_SOC_PARALELL_NUM
+            update_scaling_soc_parallel_medium!(s, z, w, λ, η, 
+                                                cones.worksoc1, cones.worksoc2, cones.worksoc3, 
+                                                rng_cones, n_shift, n_sparse_soc)
+            n_shift += n_sparse_soc
+            n_soc -= n_sparse_soc       
+        end
     end
 
     if n_soc > 0
@@ -227,11 +231,13 @@ function update_scaling!(
         n_shift += n_soc
     end  
 
-    # off-diagonal update
-    if n_sparse_soc > SPARSE_SOC_PARALELL_NUM
-        update_scaling_soc_sparse_parallel!(w, η, d, vut, rng_cones, numel_linear, n_linear, n_sparse_soc)
-    elseif n_sparse_soc > 0
-        update_scaling_soc_sparse_parallel_medium!(w, η, d, vut, rng_cones, numel_linear, n_linear, n_sparse_soc)
+    NVTX.@range "soc sparse off-diagonal" begin
+        # off-diagonal update
+        if n_sparse_soc > SPARSE_SOC_PARALELL_NUM
+            update_scaling_soc_sparse_parallel!(w, η, d, vut, rng_cones, numel_linear, n_linear, n_sparse_soc)
+        elseif n_sparse_soc > 0
+            update_scaling_soc_sparse_parallel_medium!(w, η, d, vut, rng_cones, numel_linear, n_linear, n_sparse_soc)
+        end
     end
 
     if n_exp > 0
@@ -252,7 +258,7 @@ function update_scaling!(
 end
 
 # Update Hs block for each cone.
-function get_Hs!(
+NVTX.@annotate "get_Hs!" function get_Hs!(
     cones::CompositeConeGPU{T},
     Hsblocks::CuVector{T}
 ) where {T}
@@ -315,7 +321,7 @@ end
 # WᵀWx for symmetric cones 
 # μH(s)x for symmetric cones
 
-function mul_Hs!(
+NVTX.@annotate "mul_Hs" function mul_Hs!(
     cones::CompositeConeGPU{T},
     y::CuVector{T},
     x::CuVector{T},
@@ -367,7 +373,7 @@ function mul_Hs!(
     return nothing
 end
 
-function mul_Hs_diag!(
+NVTX.@annotate "mul_Hs_diag!" function mul_Hs_diag!(
     cones::CompositeConeGPU{T},
     y::CuVector{T},
     x::CuVector{T}
@@ -411,7 +417,7 @@ function mul_Hs_diag!(
 end
 
 # x = λ ∘ λ for symmetric cone and x = s for asymmetric cones
-function affine_ds!(
+NVTX.@annotate "affine_ds!" function affine_ds!(
     cones::CompositeConeGPU{T},
     ds::CuVector{T},
     s::CuVector{T}
@@ -462,7 +468,7 @@ function affine_ds!(
     return nothing
 end
 
-function combined_ds_shift!(
+NVTX.@annotate "combined_ds_shift!" function combined_ds_shift!(
     cones::CompositeConeGPU{T},
     shift::CuVector{T},
     step_z::CuVector{T},
@@ -487,17 +493,22 @@ function combined_ds_shift!(
     η = cones.η
     
     combined_ds_shift_zero!(shift, rng_cones, idx_eq)
-    
-    combined_ds_shift_nonnegative!(shift, step_z, step_s, σμ, rng_cones, idx_inq)
+
+    NVTX.NVTX.@range "Nonnegative" begin
+        combined_ds_shift_nonnegative!(shift, step_z, step_s, σμ, rng_cones, idx_inq)
+    end
 
     n_shift = n_linear
-    if n_sparse_soc > 0 && n_sparse_soc <= SPARSE_SOC_PARALELL_NUM
-        combined_ds_shift_soc_parallel_medium!(shift, step_z, step_s, w, η, 
+    NVTX.NVTX.@range "soc medium" begin
+        if n_sparse_soc > 0 && n_sparse_soc <= SPARSE_SOC_PARALELL_NUM
+            combined_ds_shift_soc_parallel_medium!(shift, step_z, step_s, w, η,
                                 cones.worksoc1, cones.worksoc2, cones.worksoc3,
                                 rng_cones, n_shift, n_sparse_soc, σμ)
-        n_shift += n_sparse_soc
-        n_soc -= n_sparse_soc
+            n_shift += n_sparse_soc
+            n_soc -= n_sparse_soc
+        end
     end
+    
     if n_soc > 0
         combined_ds_shift_soc!(shift, step_z, step_s, w, η, rng_cones, n_shift, n_soc, σμ)
         n_shift += n_soc
@@ -521,7 +532,7 @@ function combined_ds_shift!(
 
 end
 
-function Δs_from_Δz_offset!(
+NVTX.@annotate "Δs_from_Δz_offset!" function Δs_from_Δz_offset!(
     cones::CompositeConeGPU{T},
     out::CuVector{T},
     ds::CuVector{T},
@@ -574,7 +585,7 @@ function Δs_from_Δz_offset!(
 end
 
 # maximum allowed step length over all cones
-function step_length(
+NVTX.@annotate "step_length" function step_length(
      cones::CompositeConeGPU{T},
         dz::CuVector{T},
         ds::CuVector{T},
@@ -660,7 +671,7 @@ function step_length(
 end
 
 # compute the total barrier function at the point (z + α⋅dz, s + α⋅ds)
-function compute_barrier(
+NVTX.@annotate "compute_barrier" function compute_barrier(
     cones::CompositeConeGPU{T},
     z::CuVector{T},
     s::CuVector{T},

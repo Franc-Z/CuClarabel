@@ -21,6 +21,7 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 SuiteSparse = "4607b0f0-06f3-5cda-b6b1-a6196a1729e9"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 TimerOutputs = "a759f4b9-e2f1-59dc-863e-4aeb61b1ea8f"
+NVTX = "5da4648a-3479-48b8-97b9-01cb529c0a1f"
 
 [weakdeps]
 HSL = "34c5aeac-e683-54a6-a0e9-6e0fdc586c50"
@@ -44,6 +45,7 @@ SnoopPrecompile = "1"
 StaticArrays = "1"
 TimerOutputs = "0.5"
 julia = "1.10"
+NVTX = "1.0"
 
 [extras]
 Pardiso = "46dd5b70-b6fb-5a00-ae2d-e8fea33afaf2"
