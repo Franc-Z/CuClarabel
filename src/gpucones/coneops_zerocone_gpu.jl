@@ -39,7 +39,6 @@
                 @views @. z[rng_cone_i] = zero(T)
             end
         end
-        CUDA.synchronize()
     end
 end
 
@@ -58,7 +57,6 @@ end
             @views @. s[rng_cone_i] = zero(T)
         end
     end
-    CUDA.synchronize()
 end
 
 @inline function get_Hs_zero!(
@@ -75,7 +73,6 @@ end
             @views @. Hsblocks[rng_blocks[i]] = zero(T)
         end
     end
-    CUDA.synchronize()
 end
 
 # compute the product y = WᵀWx
@@ -90,7 +87,6 @@ end
             @views @. y[rng_cones[i]] = zero(T)
         end
     end
-    CUDA.synchronize()
 end
 
 @inline function affine_ds_zero!(
@@ -104,7 +100,6 @@ end
             @views @. ds[rng_cones[i]] = zero(T)
         end
     end
-    CUDA.synchronize()
 end
 
 @inline function combined_ds_shift_zero!(
@@ -118,7 +113,6 @@ end
             @views @. shift[rng_cones[i]] = zero(T)
         end
     end
-    CUDA.synchronize()
 end
 
 @inline function Δs_from_Δz_offset_zero!(
@@ -132,7 +126,6 @@ end
             @views @. out[rng_cones[i]] = zero(T)
         end
     end
-    CUDA.synchronize()
 end
 
 # function step_length(

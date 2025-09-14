@@ -57,7 +57,7 @@ end
     threads = min(n_nonsymmetric, config.threads)
     blocks = cld(n_nonsymmetric, threads)
 
-    CUDA.@sync kernel(y, Hs, x, rng_cones, n_shift, n_nonsymmetric; threads, blocks)
+    kernel(y, Hs, x, rng_cones, n_shift, n_nonsymmetric; threads, blocks)
 end
 
 @inline function affine_ds_nonsymmetric!(
@@ -71,7 +71,7 @@ end
         rng = rng_cones[n_shift+1].start:rng_cones[n_shift+n_nonsymmetric].stop
     end
 
-    CUDA.@sync @. ds[rng] = s[rng]
+    @. ds[rng] = s[rng]
 end
 
 @inline function Δs_from_Δz_offset_nonsymmetric!(
@@ -84,7 +84,7 @@ end
     CUDA.@allowscalar begin
         rng = rng_cones[n_shift + 1].start:rng_cones[n_shift + n_nonsymmetric].stop
     end
-    CUDA.@sync @. out[rng] = ds[rng]
+    @. out[rng] = ds[rng]
 end
 
 # use the dual scaling strategy

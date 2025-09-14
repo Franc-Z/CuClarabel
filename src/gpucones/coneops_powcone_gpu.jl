@@ -52,7 +52,7 @@ end
     threads = min(n_pow, config.threads)
     blocks = cld(n_pow, threads)
 
-    CUDA.@sync kernel(z, s, αp, rng_cones, n_shift, n_pow; threads, blocks)
+    kernel(z, s, αp, rng_cones, n_shift, n_pow; threads, blocks)
 end
 
 # update the scaling matrix Hs
@@ -134,7 +134,7 @@ end
     threads = min(n_pow, config.threads)
     blocks = cld(n_pow, threads)
 
-    CUDA.@sync kernel(s, z, grad, Hs, H_dual, αp, rng_cones, μ, scaling_strategy, n_shift, n_exp, n_pow; threads, blocks)
+    kernel(s, z, grad, Hs, H_dual, αp, rng_cones, μ, scaling_strategy, n_shift, n_exp, n_pow; threads, blocks)
 end
 
 # return μH*(z) for power cone
@@ -180,7 +180,7 @@ end
     threads = min(n_pow, config.threads)
     blocks = cld(n_pow, threads)
 
-    CUDA.@sync kernel(Hsblocks, Hs, rng_blocks, n_shift, n_exp, n_pow; threads, blocks)
+    kernel(Hsblocks, Hs, rng_blocks, n_shift, n_exp, n_pow; threads, blocks)
 end
 
 # # compute the product y = Hₛx = μH(z)x
@@ -262,7 +262,6 @@ end
     blocks = cld(n_pow, threads)
 
     kernel(shift, step_z, step_s, z, grad, H_dual, αp, rng_cones, σμ, n_shift, n_exp, n_pow; threads, blocks)
-    CUDA.synchronize()
 end
 
 # function Δs_from_Δz_offset!(

@@ -107,6 +107,7 @@ NVTX.@annotate "scaled_unit_shift" function scaled_unit_shift!(
         scaled_unit_shift_psd!(z, α, rng_cones, psd_dim, n_shift, n_psd)
     end
 
+    synchronize()
     return nothing
 
 end
@@ -154,6 +155,7 @@ NVTX.@annotate "unit_initialization" function unit_initialization!(
         unit_initialization_psd_gpu!(z,s,rng_cones,psd_dim,n_shift,n_psd)
     end
 
+    synchronize()
     return nothing
 
 end
@@ -179,6 +181,7 @@ NVTX.@annotate "set_identity_scaling!" function set_identity_scaling!(
         set_identity_scaling_psd!(cones.R, cones.Rinv, cones.Hspsd, cones.psd_dim, n_psd)
     end
 
+    synchronize()
     return nothing
 end
 
@@ -254,6 +257,7 @@ NVTX.@annotate "update_scaling!" function update_scaling!(
         update_scaling_psd!(cones.chol1, cones.chol2, z, s, cones.workmat1, cones.λpsd, cones.Λisqrt, cones.R, cones.Rinv, cones.Hspsd, rng_cones, n_shift, n_psd)
     end
 
+    synchronize()
     return is_scaling_success = true
 end
 
@@ -314,6 +318,7 @@ NVTX.@annotate "get_Hs!" function get_Hs!(
         get_Hs_psd!(Hsblocks, Hspsd, rng_blocks, n_shift, n_psd)
     end
 
+    synchronize()
     return nothing
 end
 
@@ -370,6 +375,8 @@ NVTX.@annotate "mul_Hs" function mul_Hs!(
         mul_Hs_psd!(y, x, Hspsd, rng_cones, n_shift, n_psd, psd_dim)
     end
 
+    synchronize()
+
     return nothing
 end
 
@@ -413,6 +420,7 @@ NVTX.@annotate "mul_Hs_diag!" function mul_Hs_diag!(
         mul_Hs_psd!(y, x, Hspsd, rng_cones, n_shift, n_psd, psd_dim)
     end
 
+    synchronize()
     return nothing
 end
 
@@ -465,6 +473,7 @@ NVTX.@annotate "affine_ds!" function affine_ds!(
         affine_ds_psd_gpu!(ds,λpsd,rng_cones,psd_dim,n_shift,n_psd)
     end
 
+    synchronize()
     return nothing
 end
 
@@ -528,6 +537,7 @@ NVTX.@annotate "combined_ds_shift!" function combined_ds_shift!(
         combined_ds_shift_psd!(cones,shift,step_z,step_s,n_shift,n_psd,σμ)
     end
 
+    synchronize()
     return nothing
 
 end
@@ -580,6 +590,8 @@ NVTX.@annotate "Δs_from_Δz_offset!" function Δs_from_Δz_offset!(
     if n_psd > 0
         Δs_from_Δz_offset_psd!(cones, out, ds, work, n_shift, n_psd)
     end
+
+    synchronize()
 
     return nothing
 end

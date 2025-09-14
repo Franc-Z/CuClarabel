@@ -261,7 +261,7 @@ end
             #add sparse expansions columns for sparse cones 
             @views rowptr[rng_cone_i] .+= Cint(2)
         end
-        CUDA.synchronize()
+        synchronize()
     end
 
     #Count the remaining dense block
@@ -490,7 +490,7 @@ end
             block = view(map.Hsblocks, one(Cint):(rng_blocks[n_linear+n_sparse_soc].stop))
             _csr_fill_diag_gpu(rowptr, colval, nzval, block, n + one(Cint), Cint(length(block)))
         end
-        CUDA.synchronize()
+        synchronize()
     end
 
     # Initializing additional rows (columns) for sparse second-order cones
@@ -514,7 +514,7 @@ end
         @views @. nzval[map.vut] = 0.
         @views @. nzval[map.D] = 0.
     end
-    CUDA.synchronize()
+    synchronize()
 
     n_linear = cones.n_linear
     n_rec = (cones.n_soc - n_sparse_soc) + cones.n_exp + cones.n_pow + cones.n_psd
@@ -637,12 +637,12 @@ end
         @views @. mapvu[rng_vec_vt] = rowptr_i
         @views @. colval[rowptr_i] = prow
         @views @. rowptr_i += one(Cint)
-        CUDA.synchronize()
+        synchronize()
 
         @views @. mapvu[rng_vec_ut] = rowptr_i
         @views @. colval[rowptr_i] = prow + one(Cint)
         @views @. rowptr_i += one(Cint)
-        CUDA.synchronize()
+        synchronize()
 
         #add sparse expansions rows for sparse cones 
         start_col = rng_cone_i.start - one(Cint)

@@ -31,7 +31,7 @@
         αmin = min(αmin,minimum(zi))
         @views αi = α[rng_cone_i]
         @. αi = max(zi,zero(T))
-        CUDA.synchronize()
+        synchronize()
         margin += sum(αi)
     end
 
@@ -52,7 +52,6 @@ end
             @views @. z[rng_cone_i] += α 
         end
     end
-    CUDA.synchronize()
 end
 
 # unit initialization for asymmetric solves
@@ -70,7 +69,6 @@ end
             @views @. s[rng_cone_i] = one(T)
         end
     end
-    CUDA.synchronize()
 end
 
 #configure cone internals to provide W = I scaling
@@ -85,7 +83,6 @@ end
             @views @. w[rng_cones[i]] = one(T)
         end
     end
-    CUDA.synchronize()
 end
 
 @inline function update_scaling_nonnegative!(
@@ -104,7 +101,6 @@ end
         @views  @. λ[rng_cone_i] = sqrt(si*zi)
         @views  @. w[rng_cone_i] = sqrt(si/zi)
     end
-    CUDA.synchronize()
 end
 
 @inline function get_Hs_nonnegative!(
@@ -123,7 +119,6 @@ end
             @views @. Hsblocks[rng_blocks[i]] = wi^2
         end
     end
-    CUDA.synchronize()
 end
 
 # compute the product y = WᵀWx
@@ -144,7 +139,6 @@ end
             @. yi = (wi * (wi * xi))
         end
     end
-    CUDA.synchronize()
 end
 
 # returns ds = λ∘λ for the nn cone
@@ -160,7 +154,6 @@ end
             @views @. ds[rng_cones[i]] = λ[rng_cones[i]]^2
         end
     end
-    CUDA.synchronize()
 end
 
 @inline function combined_ds_shift_nonnegative!(
@@ -190,7 +183,6 @@ end
             @. shift_i = step_si*step_zi - σμ    
         end
     end    
-    CUDA.synchronize()
 end
 
 @inline function Δs_from_Δz_offset_nonnegative!(
@@ -205,7 +197,6 @@ end
             @views @. out[rng_cones[i]] = ds[rng_cones[i]] / z[rng_cones[i]]
         end
     end
-    CUDA.synchronize()
 end
 
 #return maximum allowable step length while remaining in the nn cone
@@ -259,7 +250,7 @@ end
             kernel(dzi, dsi, zi, si, αi, len_nn, αmax; threads, blocks)
         end
     end
-    CUDA.synchronize()
+    synchronize()
 end
 
 function _kernel_compute_barrier_nonnegative(
@@ -298,7 +289,7 @@ end
             rng_cone_i = rng_cones[i]
             @views worki = work[rng_cone_i]
             @views @. worki = -logsafe((s[rng_cone_i] + α*ds[rng_cone_i])*(z[rng_cone_i] + α*dz[rng_cone_i]))
-            CUDA.synchronize()
+            synchronize()
             barrier += sum(worki)
         end
     end

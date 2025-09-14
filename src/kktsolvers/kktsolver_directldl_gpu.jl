@@ -256,7 +256,7 @@ function kktsolver_setrhs!(
     b[(n+1):(n+m)]     .= rhsz
     b[(n+m+1):(n+m+p)] .= 0
     
-    CUDA.synchronize()
+    synchronize()
 
     return nothing
 end
@@ -274,7 +274,7 @@ function kktsolver_getlhs!(
     isnothing(lhsx) || (@views lhsx .= x[1:n])
     isnothing(lhsz) || (@views lhsz .= x[(n+1):(n+m)])
 
-    CUDA.synchronize()
+    synchronize()
 
     return nothing
 end
@@ -366,7 +366,7 @@ function  _iterative_refinement(
         #prospective solution is x + dx.   Use dx space to
         #hold it for a check before applying to x
         @. dx += x
-        CUDA.synchronize()
+        synchronize()
         norme = _get_refine_error!(e,b,KKT,dx)
         # norme = _get_refine_error!(kktsolver,e,b,dx) 
         isfinite(norme) || return is_success = false
@@ -404,7 +404,7 @@ function _get_refine_error!(
     
     mul!(e,KKT,ξ)    # e = b - Kξ
     @. e = b - e
-    CUDA.synchronize()
+    synchronize()
     norme = norm(e,Inf)
 
     return norme
@@ -456,7 +456,7 @@ function _get_refine_error!(
         #Corresponding diagonal part for sparse SOCs 
         @views @. e[rng_sparse_cone] += KKT.nzVal[map.diag_full[rng_sparse_cone]]*ξ[rng_sparse_cone]
         @views @. e3 = KKT.nzVal[map.diag_full[rng_ext]]*ξ3
-        CUDA.synchronize()
+        synchronize()
 
         #Extended vu parts
         mul!(e2, Matvut', ξ3, one(T), one(T))
@@ -672,5 +672,5 @@ end
         prow += 2
     end
 
-    CUDA.synchronize()
+    synchronize()
 end

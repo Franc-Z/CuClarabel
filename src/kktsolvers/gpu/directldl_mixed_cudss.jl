@@ -37,6 +37,14 @@ end
 
 ldlsolver_constructor(::Val{:cudssmixed}) = CUDSSDirectLDLSolverMixed
 ldlsolver_matrix_shape(::Val{:cudssmixed}) = :full
+ldlsolver_is_available(::Val{:cudssmixed}) = CUDA.has_cuda_gpu()
+
+function linear_solver_info(ldlsolver::CUDSSDirectLDLSolverMixed{T}) where{T}
+    name = :cudssmixed;
+    threads = 0;        #Not available for GPU solvers
+    direct = true;
+    LinearSolverInfo(name, threads, direct, 0, 0)
+end
 
 #refactor the linear system
 function refactor!(ldlsolver::CUDSSDirectLDLSolverMixed{T}) where{T}

@@ -108,7 +108,7 @@ function kkt_solve_initial_point!(
         # zero out any sparse cone variables at end
         kktsystem.workx .= zero(T)
         kktsystem.workz .= data.b
-        CUDA.synchronize()
+        synchronize()
         
         kktsolver_setrhs!(kktsystem.kktsolver, kktsystem.workx, kktsystem.workz)
         is_success = kktsolver_solve!(kktsystem.kktsolver, variables.x, variables.s)
@@ -120,7 +120,7 @@ function kkt_solve_initial_point!(
         # zero out any sparse cone variables at end
         @. kktsystem.workx = -data.q
         kktsystem.workz .=  zero(T)
-        CUDA.synchronize()
+        synchronize()
 
         kktsolver_setrhs!(kktsystem.kktsolver, kktsystem.workx, kktsystem.workz)
         is_success = kktsolver_solve!(kktsystem.kktsolver, nothing, variables.z)
@@ -128,12 +128,12 @@ function kkt_solve_initial_point!(
         # QP initialization
         @. kktsystem.workx = -data.q
         @. kktsystem.workz = data.b
-        CUDA.synchronize()
+        synchronize()
 
         kktsolver_setrhs!(kktsystem.kktsolver, kktsystem.workx, kktsystem.workz)
         is_success = kktsolver_solve!(kktsystem.kktsolver, variables.x, variables.z)
         @. variables.s = -variables.z
-        CUDA.synchronize()
+        synchronize()
     end
 
     return is_success
@@ -170,7 +170,7 @@ function kkt_solve!(
     end
 
     @. workz = Δs_const_term - rhs.z
-    CUDA.synchronize()
+    synchronize()
 
 
     #---------------------------------------------------
@@ -185,7 +185,7 @@ function kkt_solve!(
     # Numerator first
     ξ   = workx
     @. ξ = variables.x / variables.τ
-    CUDA.synchronize()
+    synchronize()
 
     workx2 = kktsystem.workx2
     mul!(workx2,data.P,x1)
@@ -194,7 +194,7 @@ function kkt_solve!(
     #offset ξ for the quadratic form in the denominator
     ξ_minus_x2    = ξ   #alias to ξ, same as workx
     @. ξ_minus_x2  -= x2
-    CUDA.synchronize()
+    synchronize()
 
     tau_den  = variables.κ/variables.τ - dot(data.q,x2) - dot(data.b,z2)
     mul!(workx2,data.P,ξ_minus_x2)
@@ -208,7 +208,7 @@ function kkt_solve!(
     lhs.τ  = tau_num/tau_den
     @. lhs.x = x1 + lhs.τ * x2
     @. lhs.z = z1 + lhs.τ * z2
-    CUDA.synchronize()
+    synchronize()
 
     #solve for Δs
     #-------------
@@ -217,7 +217,7 @@ function kkt_solve!(
     mul_Hs!(cones,lhs.s,lhs.z,workz)
     @. lhs.s = -(lhs.s + Δs_const_term)
 
-    CUDA.synchronize()
+    synchronize()
     
     #solve for Δκ
     #--------------

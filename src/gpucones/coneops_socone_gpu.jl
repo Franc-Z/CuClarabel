@@ -79,7 +79,7 @@ end
     threads = min(n_soc, config.threads)
     blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(z, α, rng_cones, n_shift, n_soc; threads, blocks)
+    kernel(z, α, rng_cones, n_shift, n_soc; threads, blocks)
 end
 
 # unit initialization for asymmetric solves
@@ -123,7 +123,7 @@ end
     threads = min(n_soc, config.threads)
     blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(z, s, rng_cones, n_shift, n_soc; threads, blocks)
+    kernel(z, s, rng_cones, n_shift, n_soc; threads, blocks)
 end 
 
 # # configure cone internals to provide W = I scaling
@@ -162,7 +162,7 @@ end
     threads = min(n_soc, config.threads)
     blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(w, η, rng_cones, n_shift, n_soc; threads, blocks)
+    kernel(w, η, rng_cones, n_shift, n_soc; threads, blocks)
 end
 
 @inline function set_identity_scaling_soc_sparse!(
@@ -267,7 +267,7 @@ end
     threads = min(n_soc, config.threads)
     blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(s, z, w, λ, η, rng_cones, n_shift, n_soc; threads, blocks)
+    kernel(s, z, w, λ, η, rng_cones, n_shift, n_soc; threads, blocks)
 
 end
 
@@ -302,7 +302,7 @@ end
     @views u[2:end] .= minus_η2.*u1.*w[2:end]
     v[1] = minus_η2*v0
     @views v[2:end] .= minus_η2.*v1.*w[2:end]
-    CUDA.synchronize()
+    synchronize()
 
     return d
 end
@@ -377,7 +377,7 @@ end
     threads = min(n_sparse_soc, config.threads)
     blocks = cld(n_sparse_soc, threads)
 
-    CUDA.@sync kernel(w, η, d, vut, rng_cones, numel_linear, n_shift, n_sparse_soc; threads, blocks)
+    kernel(w, η, d, vut, rng_cones, numel_linear, n_shift, n_sparse_soc; threads, blocks)
 
 end
 
@@ -440,7 +440,7 @@ end
     threads = min(n_dense_soc, config.threads)
     blocks = cld(n_dense_soc, threads)
 
-    CUDA.@sync kernel(Hsblocks, w, η, rng_cones, rng_blocks, n_shift, n_sparse_soc, n_dense_soc; threads, blocks)
+    kernel(Hsblocks, w, η, rng_cones, rng_blocks, n_shift, n_sparse_soc, n_dense_soc; threads, blocks)
 
 end
 
@@ -489,7 +489,7 @@ end
     threads = min(n_sparse_soc, config.threads)
     blocks = cld(n_sparse_soc, threads)
 
-    CUDA.@sync kernel(Hsblocks, η, d, rng_blocks, n_shift, n_sparse_soc; threads, blocks)
+    kernel(Hsblocks, η, d, rng_blocks, n_shift, n_sparse_soc; threads, blocks)
 
 end
 
@@ -544,7 +544,7 @@ end
     threads = min(n_soc, config.threads)
     blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(y, x, w, η, rng_cones, n_shift, n_soc; threads, blocks)
+    kernel(y, x, w, η, rng_cones, n_shift, n_soc; threads, blocks)
 end
 
 @inline function mul_Hs_dense_soc!(
@@ -567,7 +567,7 @@ end
     threads = min(n_soc, config.threads)
     blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(y, x, w, η_shift, rng_cones, n_shift, n_soc_dense; threads, blocks)
+    kernel(y, x, w, η_shift, rng_cones, n_shift, n_soc_dense; threads, blocks)
 end
 
 # returns x = λ ∘ λ for the socone
@@ -616,7 +616,7 @@ end
     threads = min(n_soc, config.threads)
     blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(ds, λ, rng_cones, n_shift, n_soc; threads, blocks)
+    kernel(ds, λ, rng_cones, n_shift, n_soc; threads, blocks)
 end
 
 function _kernel_combined_ds_shift_soc!(
@@ -714,7 +714,7 @@ end
     threads = min(n_soc, config.threads)
     blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(shift, step_z, step_s, w, η, rng_cones, n_shift, n_soc, σμ; threads, blocks)
+    kernel(shift, step_z, step_s, w, η, rng_cones, n_shift, n_soc, σμ; threads, blocks)
 end
 
 function _kernel_Δs_from_Δz_offset_soc!(
@@ -783,7 +783,7 @@ end
     threads = min(n_soc, config.threads)
     blocks = cld(n_soc, threads)
 
-    CUDA.@sync kernel(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc; threads, blocks)
+    kernel(out, ds, z, w, λ, η, rng_cones, n_shift, n_soc; threads, blocks)
 end
 
 #return maximum allowable step length while remaining in the socone
@@ -1087,8 +1087,6 @@ end
     kernel4(s, z, w, λ, η, workz, works, workw, rng_cones, n_shift, n_sparse_soc, maxthreads; threads, blocks)
     kernel5(s, z, w, λ, η, workz, works, workw, rng_cones, n_shift, n_sparse_soc, maxthreads; threads, blocks)
     kernel6(s, z, w, λ, η, workz, works, workw, rng_cones, n_shift, n_sparse_soc, maxthreads; threads, blocks)
-
-    synchronize()
 end
 
 function _kernel_parent1_update_scaling(
@@ -1355,7 +1353,7 @@ end
     threads = (1)
     blocks = (n_sparse_soc)
 
-    CUDA.@sync kernel(w, η, d, vut, rng_cones, numel_linear, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
+    kernel(w, η, d, vut, rng_cones, numel_linear, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
 
 end
 
@@ -1453,7 +1451,7 @@ end
     threads = (1)
     blocks = (n_sparse_soc)
 
-    CUDA.@sync kernel(Hsblocks, η, d, rng_blocks, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
+    kernel(Hsblocks, η, d, rng_blocks, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
 
 end
 
@@ -1524,7 +1522,6 @@ end
     # where H^{-1} = \eta^{2} (2*ww^T - J)
     kernel1(y, x, w, η, work, rng_cones, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
     kernel2(y, x, w, η, work, rng_cones, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
-    synchronize()
 end
 
 function _kernel_parent1_mul_Hs_soc(
@@ -1621,7 +1618,6 @@ end
 
     kernel1(ds, λ, work, rng_cones, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
     kernel2(ds, λ, work, rng_cones, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
-    synchronize()
 end
 
 function _kernel_parent1_affine_ds_soc(
@@ -1723,7 +1719,6 @@ end
     kernel2(shift, step_z, step_s, w, η, workz, works, work, rng_cones, n_shift, n_sparse_soc, σμ, Cint(config.threads); threads, blocks)
     kernel3(shift, step_z, step_s, w, η, workz, works, work, rng_cones, n_shift, n_sparse_soc, σμ, Cint(config.threads); threads, blocks)
     kernel4(shift, step_z, step_s, w, η, workz, works, work, rng_cones, n_shift, n_sparse_soc, σμ, Cint(config.threads); threads, blocks)
-    synchronize()
 end
 
 function _kernel_parent1_combined_ds_shift_soc(
@@ -2004,8 +1999,8 @@ function Δs_from_Δz_offset_soc_parallel_medium!(
     threads = (1)
     blocks = (n_sparse_soc)
 
-    CUDA.@sync kernel1(out, ds, z, w, λ, η, workz, workλ, workw, rng_cones, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
-    CUDA.@sync kernel2(out, ds, z, w, λ, η, workz, workλ, workw, rng_cones, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
+    kernel1(out, ds, z, w, λ, η, workz, workλ, workw, rng_cones, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
+    kernel2(out, ds, z, w, λ, η, workz, workλ, workw, rng_cones, n_shift, n_sparse_soc, Cint(config.threads); threads, blocks)
 
 end
 

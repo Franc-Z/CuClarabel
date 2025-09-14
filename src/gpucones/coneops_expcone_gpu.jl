@@ -50,7 +50,7 @@ end
     threads = min(n_exp, config.threads)
     blocks = cld(n_exp, threads)
 
-    CUDA.@sync kernel(z, s, rng_cones, n_shift, n_exp; threads, blocks)
+    kernel(z, s, rng_cones, n_shift, n_exp; threads, blocks)
  end
 
  # update the scaling matrix Hs
@@ -127,7 +127,7 @@ end
     threads = min(n_exp, config.threads)
     blocks = cld(n_exp, threads)
 
-    CUDA.@sync kernel(s, z, grad, Hs, H_dual, rng_cones, μ, scaling_strategy, n_shift, n_exp; threads, blocks)
+    kernel(s, z, grad, Hs, H_dual, rng_cones, μ, scaling_strategy, n_shift, n_exp; threads, blocks)
 end
 
 # return μH*(z) for exponential cone
@@ -171,7 +171,7 @@ end
     threads = min(n_exp, config.threads)
     blocks = cld(n_exp, threads)
 
-    CUDA.@sync kernel(Hsblocks, Hs, rng_blocks, n_shift, n_exp; threads, blocks)
+    kernel(Hsblocks, Hs, rng_blocks, n_shift, n_exp; threads, blocks)
 end
 
 function _kernel_combined_ds_shift_exp!(
@@ -231,7 +231,7 @@ end
     threads = min(n_exp, config.threads)
     blocks = cld(n_exp, threads)
 
-    CUDA.@sync kernel(shift, step_z, step_s, z, grad, H_dual, rng_cones, σμ, n_shift, n_exp; threads, blocks)
+    kernel(shift, step_z, step_s, z, grad, H_dual, rng_cones, σμ, n_shift, n_exp; threads, blocks)
 end
 
 # function Δs_from_Δz_offset!(

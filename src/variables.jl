@@ -243,7 +243,7 @@ function variables_combined_step_rhs!(
         @. step.z *= m
     end
     @. d.x  = (one(T) - σ)*r.rx
-    CUDA.synchronize()
+    synchronize()
 
     combined_ds_shift!(cones,d.z,step.z,step.s,variables.z,dotσμ)
 
@@ -252,7 +252,7 @@ function variables_combined_step_rhs!(
 
     # now we copy the scaled res for rz and d.z is no longer work
     @. d.z = (1 - σ)*r.rz
-    CUDA.synchronize()
+    synchronize()
     
     return nothing
 end
@@ -399,7 +399,7 @@ function variables_unscale!(
     variables.τ *= scaleinv
     variables.κ *= scaleinv
     
-    CUDA.synchronize()
+    synchronize()
 end
 
 # return (n_variables, n_duals)

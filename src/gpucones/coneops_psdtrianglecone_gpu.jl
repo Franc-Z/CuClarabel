@@ -65,7 +65,7 @@ end
     threads = min(n_psd, config.threads)
     blocks = cld(n_psd, threads)
 
-    CUDA.@sync kernel(z, α, rng_cones, psd_dim, n_shift, n_psd; threads, blocks)
+    kernel(z, α, rng_cones, psd_dim, n_shift, n_psd; threads, blocks)
 end
 
 # unit initialization for asymmetric solves
@@ -128,7 +128,7 @@ end
     threads = min(n_psd, config.threads)
     blocks = cld(n_psd, threads)
 
-    CUDA.@sync kernel(R, Rinv, Hspsd, psd_dim, n_psd; threads, blocks)
+    kernel(R, Rinv, Hspsd, psd_dim, n_psd; threads, blocks)
 end
 
 @inline function update_scaling_psd!(
@@ -228,7 +228,7 @@ end
     threads = min(n_psd, config.threads)
     blocks = cld(n_psd, threads)
 
-    CUDA.@sync kernel(Hsblocks, Hspsd, rng_blocks, n_shift, n_psd; threads, blocks)
+    kernel(Hsblocks, Hspsd, rng_blocks, n_shift, n_psd; threads, blocks)
 
 end
 
@@ -301,7 +301,7 @@ end
     threads = min(n_psd, config.threads)
     blocks = cld(n_psd, threads)
 
-    CUDA.@sync kernel(ds,λpsd,rng_cones,psd_dim,n_shift,n_psd; threads, blocks)
+    kernel(ds,λpsd,rng_cones,psd_dim,n_shift,n_psd; threads, blocks)
 end
 
 @inline function combined_ds_shift_psd!(
